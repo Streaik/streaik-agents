@@ -13,7 +13,7 @@ The runtime supports the standard [Microsoft Agent Framework](https://github.com
 - **Magentic** - a manager agent dynamically coordinates the team
 - **Decisions** - one agent is selected and executed based on the input
 
-**Documentation:** https://agents.streaik.com/scalar  
+**Documentation:** https://agents.streaik.net/scalar  
 **API:** https://agents.streaik.net
 
 ## Quick start
@@ -54,4 +54,4 @@ curl "https://agents.streaik.net/v1/responses" \
   }'
 ```
 
-See the [API documentation](https://agents.streaik.com/scalar) for endpoints, authentication, request schemas and examples.
+See the [API documentation](https://agents.streaik.net/scalar) for endpoints, authentication, request schemas and examples.
