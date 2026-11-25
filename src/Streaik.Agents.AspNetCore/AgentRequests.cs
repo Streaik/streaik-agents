@@ -7,27 +7,28 @@ namespace Streaik.Agents.AspNetCore;
 internal sealed record AgentRequestBodyMetadata(Type Type);
 
 // Agent routing belongs to this API, not the gateway's provider-facing request.
-internal class AgentSelection
+internal abstract class AgentSelection
 {
     public string? Model { get; init; }
     public IReadOnlyList<string?>? Models { get; init; }
     public AgentDefinition? Agent { get; init; }
     public IReadOnlyList<AgentDefinition?>? Agents { get; init; }
     public string? WorkflowType { get; init; }
-    public WorkflowMetadata? WorkflowMetadata { get; init; }
     [JsonPropertyName("workflow_type")]
     public string? WorkflowTypeSnakeCase { get; init; }
-    [JsonPropertyName("workflow_metadata")]
-    public WorkflowMetadata? WorkflowMetadataSnakeCase { get; init; }
 }
 
 internal sealed class AgentChatRequest : AgentSelection
 {
+    [JsonPropertyName("workflowMetadata")]
+    public WorkflowMetadata? WorkflowMetadata { get; init; }
     public required UIMessage[] Messages { get; init; }
 }
 
 internal sealed class AgentResponsesRequest : AgentSelection
 {
+    [JsonPropertyName("workflow_metadata")]
+    public WorkflowMetadata? WorkflowMetadata { get; init; }
     public required ResponseInput Input { get; init; }
     public bool? Stream { get; init; }
     public string? Instructions { get; init; }

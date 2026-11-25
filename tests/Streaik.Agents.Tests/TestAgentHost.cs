@@ -153,11 +153,12 @@ internal sealed class GatewayFixture : HttpMessageHandler
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        using var json = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
+        using var json = JsonDocument.Parse(request.Content is null ? "null" : await request.Content.ReadAsStringAsync(cancellationToken));
         var call = new GatewayCall(request.RequestUri!, json.RootElement.Clone(),
             request.Headers.ToDictionary(header => header.Key, header => string.Join(",", header.Value), StringComparer.OrdinalIgnoreCase));
         Calls.Enqueue(call);
-        return Respond?.Invoke(call) ?? (call.Body.GetProperty("stream").GetBoolean() ? Reply(Sse, stream: true) : Reply(Completed));
+        return Respond?.Invoke(call) ?? (request.Method == HttpMethod.Get ? Reply("""{"object":"list","data":[]}""")
+            : call.Body.GetProperty("stream").GetBoolean() ? Reply(Sse, stream: true) : Reply(Completed));
     }
 
     public static HttpResponseMessage Reply(string content, bool stream = false, HttpStatusCode status = HttpStatusCode.OK) => new(status)

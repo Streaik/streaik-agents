@@ -14,6 +14,7 @@ public static class AgentEndpoints
 {
     public static IEndpointRouteBuilder MapStreaikAgents(this IEndpointRouteBuilder endpoints)
     {
+        AgentModelEndpoints.Map(endpoints);
         endpoints.MapPost("/api/chat", (HttpContext context, AgentCatalog catalog, AgentRuntime runtime) =>
             HandleAsync(context, catalog, runtime, ui: true))
             .WithName("StreamAgentChat").WithTags("Agents").WithSummary("Stream agent chat")
@@ -63,30 +64,42 @@ public static class AgentEndpoints
             var credentials = context.RequestServices.GetService<IAgentGatewayHeaders>();
             var participants = input.Agents;
             var router = participants.Count > 1 ? input.Workflow.Router : null;
-            var providers = (router is null ? participants : participants.Append(router)).Select(AgentRuntime.GetProvider);
+            var providers = (router is null ? participants : participants.Append(router)).SelectMany(AgentRuntime.PotentialProviders);
             var singleProvider = providers.Distinct(StringComparer.Ordinal).Take(2).Count() == 1;
-            var headers = new Dictionary<AgentDefinition, IReadOnlyDictionary<string, string>?>();
+            var headerCache = new Dictionary<(AgentDefinition, AgentModel), IReadOnlyDictionary<string, string>>();
 
-            async ValueTask<IReadOnlyDictionary<string, string>?> HeadersFor(AgentDefinition agent)
-                => credentials is null ? null : await credentials.GetHeadersAsync(context, agent, singleProvider, ct);
+            async ValueTask<IReadOnlyDictionary<string, string>?> HeadersFor(AgentDefinition agent, AgentModel model, bool optional)
+            {
+                if (credentials is null) return AgentRuntime.EmptyHeaders;
+                var key = (agent, model);
+                if (headerCache.TryGetValue(key, out var headers)) return headers;
+                try
+                {
+                    headers = await credentials.GetHeadersAsync(context, agent.ForModel(model), singleProvider, ct);
+                    headerCache.Add(key, headers);
+                    return headers;
+                }
+                catch (AgentGatewayAuthenticationException) when (optional && !ct.IsCancellationRequested) { return null; }
+            }
 
             if (router is not null)
-                participants = [await runtime.SelectAgentAsync(router, participants, input.Messages, await HeadersFor(router), ct)];
-            // Resolve all participants' credentials before the first model call to a workflow.
-            foreach (var participant in participants) headers[participant] = await HeadersFor(participant);
+                participants = [await runtime.SelectAgentAsync(router, participants, input.Messages,
+                    runtime.ModelHeaders(router.Model!, (await HeadersFor(router, router.Model!, false))!), ct)];
+            // Resolve only the chosen agents, once per workflow run, before running answer inference.
+            var targets = await runtime.ResolveTargetsAsync(participants, input.Messages, HeadersFor, ct);
 
-            var primary = participants[0];
-            output = new AgentOutput(context.Response, participants.Count == 1 ? primary.Name! : input.Workflow.Type, ui, ct);
+            var primary = targets[0];
+            output = new AgentOutput(context.Response, participants.Count == 1 ? primary.Definition.Name! : input.Workflow.Type, ui, ct);
             if (!input.Stream && participants.Count == 1)
             {
-                var result = await runtime.RunAsync(primary, input.Messages, headers[primary], input.Options, ct);
+                var result = await runtime.RunResolvedAsync(primary, input.Messages, input.Options, ct);
                 await context.Response.WriteAsJsonAsync(output.Snapshot("completed", result.Text, result.Usage), ResponseJson.Default, ct);
                 return;
             }
 
             var updates = participants.Count == 1
-                ? runtime.StreamAsync(primary, input.Messages, headers[primary], input.Options, ct)
-                : runtime.RunWorkflowAsync(input.Workflow, participants, input.Messages.ToList(), headers, input.Options, input.Stream, ct);
+                ? runtime.StreamResolvedAsync(primary, input.Messages, input.Options, ct)
+                : runtime.RunWorkflowAsync(input.Workflow, targets, input.Messages.ToList(), input.Options, input.Stream, ct);
             if (!input.Stream)
             {
                 var text = new StringBuilder();
@@ -112,6 +125,10 @@ public static class AgentEndpoints
             await output.CompleteAsync();
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (AgentRequestException error) when (!context.Response.HasStarted)
+        {
+            await ErrorAsync(context, 400, error.Code, error.Message);
+        }
         catch (AgentGatewayAuthenticationException error) when (!context.Response.HasStarted)
         {
             if (!error.Forbidden) context.Response.Headers.WWWAuthenticate = "Bearer";

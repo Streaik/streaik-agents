@@ -52,14 +52,13 @@ public sealed partial class AgentRuntime
     }
 
     internal async IAsyncEnumerable<AgentResponseUpdate> RunWorkflowAsync(AgentWorkflow workflow,
-        IReadOnlyList<AgentDefinition> definitions, List<ChatMessage> messages,
-        IReadOnlyDictionary<AgentDefinition, IReadOnlyDictionary<string, string>?> headers, ChatOptions? options, bool stream,
+        IReadOnlyList<AgentRunTarget> targets, List<ChatMessage> messages, ChatOptions? options, bool stream,
         [EnumeratorCancellation] CancellationToken ct)
     {
         var usage = new UsageDetails();
         var hasUsage = false;
-        var agents = definitions.Select(definition => (AIAgent)CreateAgent(definition, headers[definition], options, ObserveUsage)).ToArray();
-        var graph = BuildWorkflow(workflow, definitions, agents);
+        var agents = targets.Select(target => (AIAgent)CreateAgent(target, options, ObserveUsage)).ToArray();
+        var graph = BuildWorkflow(workflow, targets.Select(target => target.Definition).ToArray(), agents);
         // Our endpoints expose one text item. Use the aggregated output for concurrent branches
         // to avoid interleaving their tokens, and the final answer for Magentic to keep planning private.
         var live = stream && workflow.Type is not ("concurrent" or "magentic");

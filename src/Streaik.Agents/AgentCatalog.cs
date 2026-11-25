@@ -17,6 +17,27 @@ public sealed class AgentCatalog(IEnumerable<IAgentSource> sources)
         if (names.Any(string.IsNullOrWhiteSpace))
             throw new AgentRequestException("'model' and 'models' must contain nonempty agent names.");
 
+        var merged = await GetMergedAsync(cancellationToken);
+        var resolved = new List<AgentDefinition>(names.Count);
+        foreach (var name in names)
+        {
+            if (!merged.TryGetValue(name!, out var agent))
+                throw new AgentRequestException("The named agent was not found.", "agent_not_found");
+            AgentRuntime.Validate(agent);
+            resolved.Add(agent);
+        }
+        return resolved;
+    }
+
+    public async Task<IReadOnlyList<AgentDefinition>> ListAsync(CancellationToken cancellationToken = default)
+        => (await GetMergedAsync(cancellationToken)).Values.OrderBy(agent => agent.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+
+    public async Task<AgentDefinition?> FindAsync(string name, CancellationToken cancellationToken = default)
+        => string.IsNullOrWhiteSpace(name) ? null : (await GetMergedAsync(cancellationToken)).GetValueOrDefault(name);
+
+    private async Task<Dictionary<string, AgentDefinition>> GetMergedAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
         var merged = new Dictionary<string, AgentDefinition>(StringComparer.OrdinalIgnoreCase);
         foreach (var source in _sources)
         {
@@ -35,15 +56,8 @@ public sealed class AgentCatalog(IEnumerable<IAgentSource> sources)
                 if (!string.IsNullOrWhiteSpace(agent.Name)) merged[agent.Name] = agent;
         }
 
-        var resolved = new List<AgentDefinition>(names.Count);
-        foreach (var name in names)
-        {
-            if (!merged.TryGetValue(name!, out var agent))
-                throw new AgentRequestException("The named agent was not found.", "agent_not_found");
-            AgentRuntime.Validate(agent);
-            resolved.Add(agent);
-        }
-        return resolved;
+        cancellationToken.ThrowIfCancellationRequested();
+        return merged;
     }
 }
 

@@ -137,8 +137,9 @@ public sealed class AgentEndpointTests
     [InlineData("/v1/responses", "{\"model\":\"GreetingAgent\",\"input\":\"Hi\",\"previous_response_id\":\"resp_1\"}", HttpStatusCode.BadRequest)]
     [InlineData("/v1/responses", "{\"model\":\"MissingAgent\",\"input\":\"Hi\"}", HttpStatusCode.NotFound)]
     [InlineData("/v1/responses", "{\"model\":\"GreetingAgent\",\"input\":\"Hi\",\"agent\":{}}", HttpStatusCode.BadRequest)]
-    [InlineData("/v1/responses", """{"agent":{"name":"Inline","models":[{"id":"openai/test"}]},"input":"Hi"}""", HttpStatusCode.BadRequest)]
-    [InlineData("/v1/responses", """{"agent":{"name":"Inline","model":{"id":"openai/test","providerMetadata":{}}},"input":"Hi"}""", HttpStatusCode.BadRequest)]
+    [InlineData("/v1/responses", """{"model":"GreetingAgent","input":"Hi","workflowMetadata":null}""", HttpStatusCode.BadRequest)]
+    [InlineData("/api/chat", """{"model":"GreetingAgent","messages":[{"role":"user","parts":[{"type":"text","text":"Hi"}]}],"workflowMetadata":{},"workflow_metadata":{}}""", HttpStatusCode.BadRequest)]
+    [InlineData("/v1/responses", """{"agent":{"name":"Inline","model":{"id":"router/test","type":"decision"}},"input":"Hi"}""", HttpStatusCode.BadRequest)]
     [InlineData("/api/chat", "{\"agents\":[{},{}],\"messages\":[]}", HttpStatusCode.BadRequest)]
     public async Task Unsupported_routing_shapes_are_not_silently_ignored(string path, string json, HttpStatusCode status)
     {

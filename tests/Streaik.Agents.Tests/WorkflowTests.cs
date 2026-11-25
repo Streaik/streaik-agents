@@ -125,7 +125,7 @@ public sealed class WorkflowTests
         using var request = TestAgentHost.Post("/v1/responses", new
         {
             models = new[] { "GreetingAgent", "ReviewAgent" }, workflowType = "handoff", input = "Hi", stream,
-            workflowMetadata = new { handoff = new { handoffs = new object[][] { ["GreetingAgent", new[] { "ReviewAgent" }] } } }
+            workflow_metadata = new { handoff = new { handoffs = new object[][] { ["GreetingAgent", new[] { "ReviewAgent" }] } } }
         }, "test-key");
         using var response = await host.Client.SendAsync(request);
         var result = await response.Content.ReadAsStringAsync();
@@ -161,7 +161,7 @@ public sealed class WorkflowTests
         using var request = TestAgentHost.Post("/v1/responses", new
         {
             models = new[] { "GreetingAgent", "ReviewAgent" }, workflowType = "magentic", input = "Ask the team to review this draft.", stream = true,
-            workflowMetadata = new { magentic = new { maxRounds = 4 } }
+            workflow_metadata = new { magentic = new { maxRounds = 4 } }
         }, "test-key");
         using var response = await host.Client.SendAsync(request);
         var result = await response.Content.ReadAsStringAsync();
@@ -186,7 +186,7 @@ public sealed class WorkflowTests
         using var request = TestAgentHost.Post("/v1/responses", new
         {
             models = new[] { "GreetingAgent" }, agent = new { name = "Unused", instructions = "private candidate instructions", model = new { id = "anthropic/unused" } },
-            workflowType = "decisions", workflowMetadata = new { decisions = new { model = "fireworks/router" } }, input = "Hi"
+            workflowType = "decisions", workflow_metadata = new { decisions = new { model = "fireworks/router" } }, input = "Hi"
         }, "never-fan-out");
         request.Headers.Add("x-fireworks-key", "router-only");
         request.Headers.Add("x-openai-key", "selected-only");
@@ -210,7 +210,7 @@ public sealed class WorkflowTests
     [Theory]
     [InlineData("""{"models":["GreetingAgent","Missing"],"input":"Hi"}""", HttpStatusCode.NotFound)]
     [InlineData("""{"models":["GreetingAgent","greetingagent"],"input":"Hi"}""", HttpStatusCode.BadRequest)]
-    [InlineData("""{"models":["GreetingAgent","ReviewAgent"],"workflowType":"handoff","workflowMetadata":{"handoff":{"handoffs":[["GreetingAgent",["Missing"]]]}},"input":"Hi"}""", HttpStatusCode.BadRequest)]
+    [InlineData("""{"models":["GreetingAgent","ReviewAgent"],"workflowType":"handoff","workflow_metadata":{"handoff":{"handoffs":[["GreetingAgent",["Missing"]]]}},"input":"Hi"}""", HttpStatusCode.BadRequest)]
     [InlineData("""{"models":["GreetingAgent","ReviewAgent"],"workflowType":"decisions","input":"Hi"}""", HttpStatusCode.BadRequest)]
     [InlineData("""{"models":["GreetingAgent","ReviewAgent"],"tools":[{"type":"function"}],"input":"Hi"}""", HttpStatusCode.BadRequest)]
     public async Task Invalid_workflows_never_call_the_gateway(string body, HttpStatusCode status)

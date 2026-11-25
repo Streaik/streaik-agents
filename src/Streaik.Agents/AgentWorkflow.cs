@@ -3,14 +3,14 @@ using System.Text.Json.Serialization;
 
 namespace Streaik.Agents;
 
-internal sealed record AgentWorkflow(string Type, WorkflowMetadata? Metadata)
+internal sealed record AgentWorkflow(string Type, WorkflowMetadata? Metadata, string MetadataField)
 {
     internal static readonly string[] SupportedTypes = ["sequential", "concurrent", "handoff", "groupchat", "magentic", "decisions"];
 
     public AgentDefinition? Router => Metadata?.Decisions is { } decision && Type == "decisions"
         ? new() { Name = "Decisions router", Model = new AgentModel { Id = decision.Model } } : null;
 
-    public static AgentWorkflow Validate(string? type, WorkflowMetadata? metadata, IReadOnlyList<AgentDefinition> agents)
+    public static AgentWorkflow Validate(string? type, WorkflowMetadata? metadata, IReadOnlyList<AgentDefinition> agents, string metadataField)
     {
         type ??= "sequential";
         if (!SupportedTypes.Contains(type))
@@ -21,9 +21,9 @@ internal sealed record AgentWorkflow(string Type, WorkflowMetadata? Metadata)
             || metadata.Groupchat is not null && type != "groupchat"
             || metadata.Handoff is not null && type != "handoff"
             || metadata.Magentic is not null && type != "magentic"))
-            throw new AgentRequestException("'workflowMetadata' must match 'workflowType'.");
+            throw new AgentRequestException($"'{metadataField}' must match 'workflowType'.");
 
-        var workflow = new AgentWorkflow(type, metadata);
+        var workflow = new AgentWorkflow(type, metadata, metadataField);
         switch (type)
         {
             case "handoff":
@@ -38,7 +38,7 @@ internal sealed record AgentWorkflow(string Type, WorkflowMetadata? Metadata)
             case "groupchat" when metadata?.Groupchat?.MaximumIterationCount is <= 0:
                 throw new AgentRequestException("Group chat maximumIterationCount must be positive.");
             case "decisions":
-                _ = AgentRuntime.GetProvider(workflow.Router ?? throw new AgentRequestException("Provide 'workflowMetadata.decisions.model'."));
+                _ = AgentRuntime.GetProvider(workflow.Router ?? throw new AgentRequestException($"Provide '{metadataField}.decisions.model'."));
                 break;
         }
         return workflow;
@@ -47,7 +47,7 @@ internal sealed record AgentWorkflow(string Type, WorkflowMetadata? Metadata)
     public IReadOnlyList<(int From, int To)> GetHandoffs(IReadOnlyList<AgentDefinition> agents)
     {
         if (Metadata?.Handoff?.Handoffs is not { Count: > 0 } pairs)
-            throw new AgentRequestException("Provide at least one pair in 'workflowMetadata.handoff.handoffs'.");
+            throw new AgentRequestException($"Provide at least one pair in '{MetadataField}.handoff.handoffs'.");
 
         var index = agents.Select((agent, i) => (agent.Name!, i)).ToDictionary(pair => pair.Item1, pair => pair.i, StringComparer.OrdinalIgnoreCase);
         var edges = new List<(int From, int To)>();

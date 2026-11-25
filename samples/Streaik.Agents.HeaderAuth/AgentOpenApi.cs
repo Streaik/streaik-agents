@@ -40,7 +40,8 @@ internal static class AgentOpenApi
         {
             if (context.Description.ActionDescriptor.EndpointMetadata.OfType<AgentRequestBodyMetadata>().LastOrDefault() is not { } body) return;
             var ui = body.Type == typeof(AgentChatRequest);
-            operation.Description = (ui ? "Returns AI SDK UI Message Stream events. " : "Returns a Responses object, or Responses SSE events when stream is true. ") + Routing + " " + ProviderAuth;
+            operation.Description = (ui ? "Returns AI SDK UI Message Stream events. Use workflowMetadata for workflow options. "
+                : "Returns a Responses object, or Responses SSE events when stream is true. Use workflow_metadata for workflow options. ") + Routing + " " + ProviderAuth;
             operation.RequestBody = new OpenApiRequestBody
             {
                 Required = true,

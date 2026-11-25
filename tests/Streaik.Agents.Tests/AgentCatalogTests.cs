@@ -24,13 +24,17 @@ public sealed class AgentCatalogTests
             ("MistralAgent", "mistral/mistral-medium-3-5"),
             ("OpenAIAgent", "openai/gpt-6.1-sol"),
             ("SpaceXAIAgent", "spacexai/grok-4.7")
-        }, definitions.Select(agent => (agent.Name, agent.Model?.Id)));
+        }, definitions.Select(agent => (agent.Name, agent.Models?.FirstOrDefault()?.Id ?? agent.Model?.Id)));
         Assert.All(definitions, agent =>
         {
             Assert.False(string.IsNullOrWhiteSpace(agent.Description));
             Assert.False(string.IsNullOrWhiteSpace(agent.Instructions));
-            Assert.Equal("v1/responses", agent.Transport);
         });
+        var openai = Assert.Single(definitions, agent => agent.Name == "OpenAIAgent");
+        Assert.Null(openai.Model);
+        Assert.True(openai.Models!.Count > 1);
+        Assert.Equal("responses_multi_agent=v1", openai.Models[0]!.ProviderHeaders!["OpenAI-Beta"]);
+        Assert.True(openai.Models[0]!.ProviderMetadata!.ContainsKey("tools"));
     }
 
     [Theory]
@@ -43,7 +47,8 @@ public sealed class AgentCatalogTests
             azure ? TestAgentHost.Token("alice") : "fixture-key");
         using var response = await host.Client.SendAsync(request);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        var call = Assert.Single(host.Gateway.Calls);
+        Assert.Single(host.Gateway.Calls, call => call.Endpoint.AbsolutePath == "/base/v1/models");
+        var call = Assert.Single(host.Gateway.Calls, call => call.Endpoint.AbsolutePath == "/base/v1/responses");
         Assert.Equal("openai/gpt-6.1-sol", call.Body.GetProperty("model").GetString());
         Assert.Equal("/base/v1/responses", call.Endpoint.AbsolutePath);
     }
@@ -88,8 +93,13 @@ public sealed class AgentCatalogTests
         var catalog = new AgentCatalog([new JsonAgentSource(), new BlobAgentSource(container, @"\tenant\reference\", clock)]);
 
         var resolved = await catalog.ResolveAsync(["OpenAIAgent", "Extra", "GoogleAgent"]);
-        Assert.Equal(new[] { "openai/from-blob", "openai/preferred", "google/gemini-omni-1.2-flash" },
-            resolved.Select(agent => agent.Model!.Id));
+        Assert.Null(resolved[0].Model);
+        Assert.Equal(new string?[] { null, null, "openai/from-blob", "openai/other" }, resolved[0].Models!.Select(model => model?.Id));
+        Assert.Empty(resolved[0].Models![2]!.ProviderMetadata!["tools"].EnumerateArray());
+        Assert.Equal("openai/speech", resolved[0].Speech!.Model!.Id);
+        Assert.Equal("openai/preferred", resolved[1].Model!.Id);
+        Assert.Equal("openai/ignored", Assert.Single(resolved[1].Models!)!.Id);
+        Assert.Equal("google/gemini-omni-1.2-flash", resolved[2].Models?[0]?.Id ?? resolved[2].Model?.Id);
         Assert.Equal("Storage definition", resolved[0].Description);
         Assert.Equal("Reply from the blob.", resolved[0].Instructions);
         Assert.Equal("responses", resolved[0].Transport);
@@ -101,7 +111,7 @@ public sealed class AgentCatalogTests
         Assert.Same(resolved[0], Assert.Single(await catalog.ResolveAsync(["openaiagent"])));
         Assert.Equal(1, container.Listings);
         clock.Now = clock.Now.AddMinutes(10);
-        Assert.Equal("openai/gpt-6.1-sol", Assert.Single(await catalog.ResolveAsync(["openaiagent"])).Model!.Id);
+        Assert.Equal("openai/gpt-6.1-sol", Assert.Single(await catalog.ResolveAsync(["openaiagent"])).Models![0]!.Id);
         Assert.Equal(2, container.Listings);
     }
 

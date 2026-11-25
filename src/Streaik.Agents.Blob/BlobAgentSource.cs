@@ -41,7 +41,7 @@ public sealed class BlobAgentSource(BlobContainerClient container, string? prefi
             if (!blob.Name.EndsWith("Agent.json", StringComparison.OrdinalIgnoreCase)) continue;
             var download = await container.GetBlobClient(blob.Name).DownloadContentAsync(cancellationToken);
             using var stream = download.Value.Content.ToStream();
-            if (AgentDefinitionImport.Read(stream) is { } agent) agents.Add(agent);
+            if (AgentDefinitionImport.Read(stream, blob.Properties?.LastModified) is { } agent) agents.Add(agent);
         }
         return agents.AsReadOnly();
     }

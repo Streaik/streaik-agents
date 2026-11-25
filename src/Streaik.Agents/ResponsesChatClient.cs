@@ -7,9 +7,15 @@ using Streaik.Responses.Streaming;
 
 namespace Streaik.Agents;
 
-internal sealed class ResponsesChatClient(HttpClient gateway, string model, IReadOnlyDictionary<string, string>? headers,
+internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, IReadOnlyDictionary<string, string>? headers,
     ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null) : IChatClient
 {
+    private static readonly HashSet<string> ProtectedFields = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "model", "input", "instructions", "stream", "store", "background", "previous_response_id", "previousResponseId", "conversation",
+        "tools", "tool_choice", "toolChoice", "parallel_tool_calls", "multi_agent", "multiAgent", "mcp_servers", "mcpServers", "headers"
+    };
+
     public async Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
         CancellationToken cancellationToken = default)
     {
@@ -74,34 +80,50 @@ internal sealed class ResponsesChatClient(HttpClient gateway, string model, IRea
         throw new InvalidOperationException("The upstream stream closed without a terminal response.");
     }
 
-    private ResponseRequest CreateRequest(IEnumerable<ChatMessage> messages, ChatOptions? options, bool stream) => new()
+    private ResponseRequest CreateRequest(IEnumerable<ChatMessage> messages, ChatOptions? options, bool stream)
     {
-        Model = model,
-        Instructions = options?.Instructions,
-        Input = new ResponseInput(messages.SelectMany(MapMessage)),
-        Temperature = options?.Temperature ?? defaults?.Temperature,
-        TopP = options?.TopP ?? defaults?.TopP,
-        MaxOutputTokens = options?.MaxOutputTokens ?? defaults?.MaxOutputTokens,
-        Tools = options?.Tools?.OfType<AIFunctionDeclaration>().Select(FunctionTool).ToList(),
-        ToolChoice = options?.ToolMode switch
+        var request = new ResponseRequest
         {
-            RequiredChatToolMode { RequiredFunctionName: { } name } => new { type = "function", name },
-            RequiredChatToolMode => "required",
-            NoneChatToolMode => "none",
-            _ => null
-        },
-        Text = options?.ResponseFormat switch
-        {
-            ChatResponseFormatJson { Schema: { } schema } json => new
+            Model = model.Id,
+            Instructions = options?.Instructions,
+            Input = new ResponseInput(messages.SelectMany(MapMessage)),
+            Temperature = options?.Temperature ?? defaults?.Temperature ?? model.Options?.Temperature,
+            TopP = options?.TopP ?? defaults?.TopP,
+            MaxOutputTokens = options?.MaxOutputTokens ?? defaults?.MaxOutputTokens,
+            Tools = options?.Tools?.OfType<AIFunctionDeclaration>().Select(FunctionTool).ToList(),
+            ToolChoice = options?.ToolMode switch
             {
-                format = new { type = "json_schema", name = json.SchemaName ?? "workflow_output", schema, description = json.SchemaDescription }
+                RequiredChatToolMode { RequiredFunctionName: { } name } => new { type = "function", name },
+                RequiredChatToolMode => "required",
+                NoneChatToolMode => "none",
+                _ => null
             },
-            ChatResponseFormatJson => new { format = new { type = "json_object" } },
-            _ => null
-        },
-        Stream = stream,
-        Store = false
-    };
+            Text = options?.ResponseFormat switch
+            {
+                ChatResponseFormatJson { Schema: { } schema } json => new
+                {
+                    format = new { type = "json_schema", name = json.SchemaName ?? "workflow_output", schema, description = json.SchemaDescription }
+                },
+                ChatResponseFormatJson => new { format = new { type = "json_object" } },
+                _ => null
+            },
+            Stream = stream,
+            Store = false
+        };
+        if (model.ProviderMetadata is not { Count: > 0 } metadata) return request;
+
+        // AIHappey stores native Responses options. Deserialize the merged object so known fields
+        // remain typed, while unknown provider options remain extension data. Runtime values win.
+        var fields = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, value) in metadata)
+            if (!ProtectedFields.Contains(name)) fields[name] = value;
+        foreach (var property in JsonSerializer.SerializeToElement(request, ResponseJson.Default).EnumerateObject())
+        {
+            fields.Remove(property.Name);
+            fields.Add(property.Name, property.Value);
+        }
+        return JsonSerializer.SerializeToElement(fields).Deserialize<ResponseRequest>(ResponseJson.Default)!;
+    }
 
     private static IEnumerable<ResponseInputItem> MapMessage(ChatMessage message)
     {
