@@ -1,9 +1,11 @@
 using System.Net;
+using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.AI;
 using Streaik.Responses;
 
 namespace Streaik.Agents.AspNetCore;
@@ -13,9 +15,15 @@ public static class AgentEndpoints
     public static IEndpointRouteBuilder MapStreaikAgents(this IEndpointRouteBuilder endpoints)
     {
         endpoints.MapPost("/api/chat", (HttpContext context, AgentCatalog catalog, AgentRuntime runtime) =>
-            HandleAsync(context, catalog, runtime, ui: true));
+            HandleAsync(context, catalog, runtime, ui: true))
+            .WithName("StreamAgentChat").WithTags("Agents").WithSummary("Stream agent chat")
+            .WithMetadata(new AgentRequestBodyMetadata(typeof(AgentChatRequest)))
+            .Produces<string>(200, "text/event-stream");
         endpoints.MapPost("/v1/responses", (HttpContext context, AgentCatalog catalog, AgentRuntime runtime) =>
-            HandleAsync(context, catalog, runtime, ui: false));
+            HandleAsync(context, catalog, runtime, ui: false))
+            .WithName("CreateAgentResponse").WithTags("Agents").WithSummary("Create an agent response")
+            .WithMetadata(new AgentRequestBodyMetadata(typeof(AgentResponsesRequest)))
+            .Produces<ResponseResult>(200, "application/json", "text/event-stream");
         return endpoints;
     }
 
@@ -44,19 +52,50 @@ public static class AgentEndpoints
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
 
-        var output = new AgentOutput(context.Response, input.Agent.Name!, ui, ct);
+        AgentOutput? output = null;
         try
         {
             var credentials = context.RequestServices.GetService<IAgentGatewayHeaders>();
-            var headers = credentials is null ? null : await credentials.GetHeadersAsync(context, input.Agent, ct);
-            if (!input.Stream)
+            var participants = input.Agents;
+            var router = participants.Count > 1 ? input.Workflow.Router : null;
+            var providers = (router is null ? participants : participants.Append(router)).Select(AgentRuntime.GetProvider);
+            var singleProvider = providers.Distinct(StringComparer.Ordinal).Take(2).Count() == 1;
+            var headers = new Dictionary<AgentDefinition, IReadOnlyDictionary<string, string>?>();
+
+            async ValueTask<IReadOnlyDictionary<string, string>?> HeadersFor(AgentDefinition agent)
+                => credentials is null ? null : await credentials.GetHeadersAsync(context, agent, singleProvider, ct);
+
+            if (router is not null)
+                participants = [await runtime.SelectAgentAsync(router, participants, input.Messages, await HeadersFor(router), ct)];
+            // Resolve all participants' credentials before the first model call to a workflow.
+            foreach (var participant in participants) headers[participant] = await HeadersFor(participant);
+
+            var primary = participants[0];
+            output = new AgentOutput(context.Response, participants.Count == 1 ? primary.Name! : input.Workflow.Type, ui, ct);
+            if (!input.Stream && participants.Count == 1)
             {
-                var result = await runtime.RunAsync(input.Agent, input.Messages, headers, input.Options, ct);
+                var result = await runtime.RunAsync(primary, input.Messages, headers[primary], input.Options, ct);
                 await context.Response.WriteAsJsonAsync(output.Snapshot("completed", result.Text, result.Usage), ResponseJson.Default, ct);
                 return;
             }
 
-            await using var stream = runtime.StreamAsync(input.Agent, input.Messages, headers, input.Options, ct).GetAsyncEnumerator(ct);
+            var updates = participants.Count == 1
+                ? runtime.StreamAsync(primary, input.Messages, headers[primary], input.Options, ct)
+                : runtime.RunWorkflowAsync(input.Workflow, participants, input.Messages.ToList(), headers, input.Options, input.Stream, ct);
+            if (!input.Stream)
+            {
+                var text = new StringBuilder();
+                UsageDetails? usage = null;
+                await foreach (var update in updates.WithCancellation(ct))
+                {
+                    text.Append(update.Text);
+                    usage = update.Contents.OfType<UsageContent>().LastOrDefault()?.Details ?? usage;
+                }
+                await context.Response.WriteAsJsonAsync(output.Snapshot("completed", text.ToString(), usage), ResponseJson.Default, ct);
+                return;
+            }
+
+            await using var stream = updates.GetAsyncEnumerator(ct);
             // Keep upstream connect/authorization failures as HTTP errors until an event is available.
             var more = await stream.MoveNextAsync();
             await output.StartAsync();
@@ -88,7 +127,7 @@ public static class AgentEndpoints
             };
             if (context.Response.HasStarted)
             {
-                if (input.Stream) await output.FailAsync(code, message);
+                if (input.Stream && output is not null) await output.FailAsync(code, message);
                 else context.Abort();
             }
             else await ErrorAsync(context, status, code, message);

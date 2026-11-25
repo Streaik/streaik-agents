@@ -3,7 +3,7 @@ using Microsoft.Extensions.AI;
 
 namespace Streaik.Agents;
 
-public sealed class AgentRuntime(HttpClient gateway)
+public sealed partial class AgentRuntime(HttpClient gateway)
 {
     private const string Responses = "responses";
 
@@ -45,12 +45,13 @@ public sealed class AgentRuntime(HttpClient gateway)
         => CreateAgent(definition, gatewayHeaders).RunStreamingAsync(messages,
             options: options is null ? null : new ChatClientAgentRunOptions(options), cancellationToken: cancellationToken);
 
-    private ChatClientAgent CreateAgent(AgentDefinition definition, IReadOnlyDictionary<string, string>? gatewayHeaders)
+    private ChatClientAgent CreateAgent(AgentDefinition definition, IReadOnlyDictionary<string, string>? gatewayHeaders,
+        ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null)
     {
         Validate(definition);
         IChatClient client = GetTransport(definition) switch
         {
-            Responses => new ResponsesChatClient(gateway, definition.Model!.Id!, gatewayHeaders),
+            Responses => new ResponsesChatClient(gateway, definition.Model!.Id!, gatewayHeaders, defaults, observeUsage),
             _ => throw new InvalidOperationException("Agent transport was not registered.")
         };
         return new ChatClientAgent(client, instructions: definition.Instructions,

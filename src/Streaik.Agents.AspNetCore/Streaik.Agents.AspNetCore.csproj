@@ -9,6 +9,7 @@
   <ItemGroup>
     <None Include="../../README.md" Pack="true" PackagePath="/" />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <InternalsVisibleTo Include="Streaik.Agents.HeaderAuth" />
     <ProjectReference Include="../Streaik.Agents/Streaik.Agents.csproj" />
     <ProjectReference Include="../../../streaik-vercel/src/Streaik.Vercel/Streaik.Vercel.csproj" />
   </ItemGroup>

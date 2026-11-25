@@ -9,6 +9,9 @@
   <ItemGroup>
     <None Include="../../README.md" Pack="true" PackagePath="/" />
     <PackageReference Include="Microsoft.Agents.AI" Version="1.28.0" />
+    <PackageReference Include="Microsoft.Agents.AI.Workflows" Version="1.28.0" />
     <ProjectReference Include="../../../streaik-responses/src/Streaik.Responses/Streaik.Responses.csproj" />
+    <ProjectReference Include="../../../streaik-vercel/src/Streaik.Vercel/Streaik.Vercel.csproj" />
+    <InternalsVisibleTo Include="Streaik.Agents.AspNetCore" />
   </ItemGroup>
 </Project>

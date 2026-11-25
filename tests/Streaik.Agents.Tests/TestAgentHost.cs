@@ -45,6 +45,8 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
             ["StreaikAgents:Agents:0:Name"] = "GreetingAgent",
             ["StreaikAgents:Agents:0:Instructions"] = "Reply with a greeting.",
             ["StreaikAgents:Agents:0:Model:Id"] = "openai/test",
+            ["StreaikAgents:Agents:1:Name"] = "ReviewAgent",
+            ["StreaikAgents:Agents:1:Model:Id"] = "openai/review",
             ["StreaikAgents:GatewayScopes:0"] = DownstreamScope,
             ["AzureAd:Instance"] = "https://login.microsoftonline.com/",
             ["AzureAd:TenantId"] = "00000000-0000-0000-0000-000000000002",
@@ -71,11 +73,19 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
                 };
             });
         }
-        else builder.Services.AddScoped<IAgentGatewayHeaders, HeaderGatewayHeaders>();
+        else
+        {
+            builder.Services.AddScoped<IAgentGatewayHeaders, HeaderGatewayHeaders>();
+            builder.Services.AddOpenApi(AgentOpenApi.Configure);
+        }
 
         var app = builder.Build();
         if (azure) app.MapAzureAuthAgents();
-        else app.MapStreaikAgents();
+        else
+        {
+            app.MapStreaikAgents();
+            app.MapAgentReference();
+        }
         await app.StartAsync();
         return new TestAgentHost(app, new HttpClient(new SocketsHttpHandler { MaxResponseDrainSize = 0 })
         {
@@ -145,6 +155,17 @@ internal sealed class GatewayFixture : HttpMessageHandler
     {
         Content = new StringContent(content, Encoding.UTF8, stream ? "text/event-stream" : "application/json")
     };
+
+    public static HttpResponseMessage Complete(GatewayCall call, object[] output)
+    {
+        var result = JsonSerializer.Serialize(new { id = $"resp_{Guid.NewGuid():N}", status = "completed", output });
+        return call.Body.GetProperty("stream").GetBoolean()
+            ? Reply($"data: {{\"type\":\"response.completed\",\"response\":{result}}}\n\ndata: [DONE]\n\n", stream: true)
+            : Reply(result);
+    }
+
+    public static HttpResponseMessage Text(GatewayCall call, string text) => Complete(call,
+        [new { id = "msg_fixture", type = "message", role = "assistant", content = new[] { new { type = "output_text", text } } }]);
 }
 
 internal sealed record GatewayCall(Uri Endpoint, JsonElement Body, IReadOnlyDictionary<string, string> Headers);

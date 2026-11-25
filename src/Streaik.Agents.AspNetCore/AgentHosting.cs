@@ -29,6 +29,10 @@ public static class AgentHosting
 public interface IAgentGatewayHeaders
 {
     ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, AgentDefinition agent, CancellationToken cancellationToken);
+
+    /// <summary>Indicates whether an unscoped provider API key is unambiguous for this request.</summary>
+    ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, AgentDefinition agent,
+        bool singleProvider, CancellationToken cancellationToken) => GetHeadersAsync(context, agent, cancellationToken);
 }
 
 public sealed class AgentGatewayAuthenticationException(string message, bool forbidden = false) : Exception(message)

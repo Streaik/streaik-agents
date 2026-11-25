@@ -5,6 +5,8 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="11.0.0" />
+    <PackageReference Include="Scalar.AspNetCore" Version="3.2.1" />
     <ProjectReference Include="../../src/Streaik.Agents.AspNetCore/Streaik.Agents.AspNetCore.csproj" />
     <InternalsVisibleTo Include="Streaik.Agents.Tests" />
   </ItemGroup>

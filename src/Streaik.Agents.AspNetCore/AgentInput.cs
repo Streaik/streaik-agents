@@ -5,7 +5,8 @@ using Streaik.Vercel.Models;
 
 namespace Streaik.Agents.AspNetCore;
 
-internal sealed record AgentInput(AgentDefinition Agent, IReadOnlyList<ChatMessage> Messages, bool Stream, ChatOptions? Options = null)
+internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWorkflow Workflow,
+    IReadOnlyList<ChatMessage> Messages, bool Stream, ChatOptions? Options = null)
 {
     private static readonly JsonSerializerOptions WebJson = new(JsonSerializerDefaults.Web);
 
@@ -14,7 +15,7 @@ internal sealed record AgentInput(AgentDefinition Agent, IReadOnlyList<ChatMessa
         if (body.ValueKind != JsonValueKind.Object)
             throw new AgentRequestException("The request body must be a JSON object.");
 
-        RejectFields(body, "models", "workflowType", "workflowFile", "workflowMetadata", "workflow_type", "workflow_file", "workflow_metadata",
+        RejectFields(body, "workflowFile", "workflow_file",
             "conversation", "previous_response_id", "tool_choice", "toolChoice");
         if (body.TryGetProperty("background", out var background) && background.ValueKind is not (JsonValueKind.False or JsonValueKind.Null)
             || body.TryGetProperty("store", out var store) && store.ValueKind is not (JsonValueKind.False or JsonValueKind.Null))
@@ -23,21 +24,23 @@ internal sealed record AgentInput(AgentDefinition Agent, IReadOnlyList<ChatMessa
             && !(tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() == 0))
             throw new AgentRequestException("Tools are not supported in v1.");
 
-        var name = body.TryGetProperty("model", out var model) ? model.Deserialize<string>(WebJson) : null;
-        var inline = body.TryGetProperty("agent", out var definition) ? definition.Deserialize<AgentDefinition>(WebJson) : null;
-        if (body.TryGetProperty("agents", out var agents) && agents.ValueKind != JsonValueKind.Null)
-        {
-            if (body.TryGetProperty("agent", out _) || agents.ValueKind != JsonValueKind.Array || agents.GetArrayLength() != 1
-                || agents[0].ValueKind != JsonValueKind.Object)
-                throw new AgentRequestException("Only one inline agent is supported.");
-            inline = agents[0].Deserialize<AgentDefinition>(WebJson);
-        }
-        var agent = catalog.Resolve(name, inline);
+        var selection = body.Deserialize<AgentSelection>(WebJson)!;
+        var agents = new List<AgentDefinition>();
+        if (selection.Agent is { } inline) agents.Add(catalog.Resolve(null, inline));
+        foreach (var agent in selection.Agents ?? [])
+            agents.Add(catalog.Resolve(null, agent ?? throw new AgentRequestException("'agents' must contain agent definitions.")));
+        foreach (var name in selection.Models ?? [])
+            agents.Add(catalog.Resolve(name ?? throw new AgentRequestException("'models' must contain named agents."), null));
+        if (selection.Model is { } model) agents.Add(catalog.Resolve(model, null));
+        if (agents.Count == 0)
+            throw new AgentRequestException("Select at least one agent using 'model', 'models', 'agent', or 'agents'.");
+        var workflow = AgentWorkflow.Validate(selection.WorkflowType ?? selection.WorkflowTypeSnakeCase,
+            selection.WorkflowMetadata ?? selection.WorkflowMetadataSnakeCase, agents);
 
         if (ui)
         {
             var messages = body.TryGetProperty("messages", out var value) ? value.Deserialize<UIMessage[]>(WebJson) : null;
-            return new AgentInput(agent, ValidateMessages(messages?.Select(MapUiMessage)), Stream: true);
+            return new AgentInput(agents, workflow, ValidateMessages(messages?.Select(MapUiMessage)), Stream: true);
         }
 
         var request = body.Deserialize<ResponseRequest>(ResponseJson.Default)!;
@@ -47,7 +50,7 @@ internal sealed record AgentInput(AgentDefinition Agent, IReadOnlyList<ChatMessa
             history.Insert(0, new ChatMessage(ChatRole.System, request.Instructions));
         if (request.MaxOutputTokens is <= 0)
             throw new AgentRequestException("'max_output_tokens' must be positive.");
-        return new AgentInput(agent, ValidateMessages(history), request.Stream == true, new ChatOptions
+        return new AgentInput(agents, workflow, ValidateMessages(history), request.Stream == true, new ChatOptions
         {
             MaxOutputTokens = request.MaxOutputTokens,
             Temperature = (float?)request.Temperature,
