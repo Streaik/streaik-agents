@@ -21,6 +21,7 @@ using Microsoft.IdentityModel.Tokens;
 using Streaik.Agents.AspNetCore;
 using Streaik.Agents.AzureAuth;
 using Streaik.Agents.HeaderAuth;
+using Streaik.Agents.Json;
 
 namespace Streaik.Agents.Tests;
 
@@ -34,7 +35,7 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
     public HttpClient Client { get; } = client;
     public GatewayFixture Gateway { get; } = gateway;
 
-    public static async Task<TestAgentHost> StartAsync(bool azure = false)
+    public static async Task<TestAgentHost> StartAsync(bool azure = false, IAgentSource? extraSource = null)
     {
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
@@ -42,11 +43,6 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
         builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["StreaikAgents:GatewayEndpoint"] = "https://gateway.example.test/base",
-            ["StreaikAgents:Agents:0:Name"] = "GreetingAgent",
-            ["StreaikAgents:Agents:0:Instructions"] = "Reply with a greeting.",
-            ["StreaikAgents:Agents:0:Model:Id"] = "openai/test",
-            ["StreaikAgents:Agents:1:Name"] = "ReviewAgent",
-            ["StreaikAgents:Agents:1:Model:Id"] = "openai/review",
             ["StreaikAgents:GatewayScopes:0"] = DownstreamScope,
             ["AzureAd:Instance"] = "https://login.microsoftonline.com/",
             ["AzureAd:TenantId"] = "00000000-0000-0000-0000-000000000002",
@@ -59,6 +55,7 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
         builder.Services.AddHttpClient(AgentHosting.GatewayClientName).ConfigurePrimaryHttpMessageHandler(() => fixture);
         if (azure)
         {
+            builder.Services.AddAzureAgentSources(builder.Configuration.GetSection("BlobAgents"));
             builder.Services.AddAzureAgentAuth(builder.Configuration);
             builder.Services.Replace(ServiceDescriptor.Singleton(_ => DispatchProxy.Create<ITokenAcquisition, TestAcquisition>()));
             builder.Services.PostConfigure<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme, options =>
@@ -75,9 +72,12 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
         }
         else
         {
+            builder.Services.AddSingleton<IAgentSource, JsonAgentSource>();
             builder.Services.AddScoped<IAgentGatewayHeaders, HeaderGatewayHeaders>();
             builder.Services.AddOpenApi(AgentOpenApi.Configure);
         }
+        builder.Services.AddSingleton<IAgentSource, TestAgentSource>();
+        if (extraSource is not null) builder.Services.AddSingleton(extraSource);
 
         var app = builder.Build();
         if (azure) app.MapAzureAuthAgents();
@@ -123,6 +123,15 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
             Assert.False(string.IsNullOrWhiteSpace(subject));
             return Task.FromResult($"downstream-{subject}");
         }
+    }
+
+    private sealed class TestAgentSource : IAgentSource
+    {
+        public Task<IReadOnlyList<AgentDefinition>> GetAgentsAsync(CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyList<AgentDefinition>>([
+                new() { Name = "GreetingAgent", Instructions = "Reply with a greeting.", Model = new() { Id = "openai/test" } },
+                new() { Name = "ReviewAgent", Model = new() { Id = "openai/review" } }
+            ]);
     }
 }
 

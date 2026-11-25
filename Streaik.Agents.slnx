@@ -1,6 +1,8 @@
 <Solution>
   <Project Path="src/Streaik.Agents/Streaik.Agents.csproj" />
   <Project Path="src/Streaik.Agents.AspNetCore/Streaik.Agents.AspNetCore.csproj" />
+  <Project Path="src/Streaik.Agents.Json/Streaik.Agents.Json.csproj" />
+  <Project Path="src/Streaik.Agents.Blob/Streaik.Agents.Blob.csproj" />
   <Folder Name="/Samples/">
     <Project Path="samples/Streaik.Agents.HeaderAuth/Streaik.Agents.HeaderAuth.csproj" />
     <Project Path="samples/Streaik.Agents.AzureAuth/Streaik.Agents.AzureAuth.csproj" />

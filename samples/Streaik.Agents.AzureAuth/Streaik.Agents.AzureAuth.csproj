@@ -9,6 +9,8 @@
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="11.0.0" />
     <PackageReference Include="Microsoft.Identity.Web" Version="4.18.0" />
     <ProjectReference Include="../../src/Streaik.Agents.AspNetCore/Streaik.Agents.AspNetCore.csproj" />
+    <ProjectReference Include="../../src/Streaik.Agents.Json/Streaik.Agents.Json.csproj" />
+    <ProjectReference Include="../../src/Streaik.Agents.Blob/Streaik.Agents.Blob.csproj" />
     <InternalsVisibleTo Include="Streaik.Agents.Tests" />
   </ItemGroup>
 </Project>

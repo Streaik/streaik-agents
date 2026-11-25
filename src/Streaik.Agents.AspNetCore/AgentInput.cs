@@ -10,7 +10,7 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
 {
     private static readonly JsonSerializerOptions WebJson = new(JsonSerializerDefaults.Web);
 
-    public static AgentInput Parse(JsonElement body, AgentCatalog catalog, bool ui)
+    public static async Task<AgentInput> ParseAsync(JsonElement body, AgentCatalog catalog, bool ui, CancellationToken cancellationToken)
     {
         if (body.ValueKind != JsonValueKind.Object)
             throw new AgentRequestException("The request body must be a JSON object.");
@@ -26,12 +26,12 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
 
         var selection = body.Deserialize<AgentSelection>(WebJson)!;
         var agents = new List<AgentDefinition>();
-        if (selection.Agent is { } inline) agents.Add(catalog.Resolve(null, inline));
+        if (selection.Agent is { } inline) agents.Add(ValidateInline(inline));
         foreach (var agent in selection.Agents ?? [])
-            agents.Add(catalog.Resolve(null, agent ?? throw new AgentRequestException("'agents' must contain agent definitions.")));
-        foreach (var name in selection.Models ?? [])
-            agents.Add(catalog.Resolve(name ?? throw new AgentRequestException("'models' must contain named agents."), null));
-        if (selection.Model is { } model) agents.Add(catalog.Resolve(model, null));
+            agents.Add(ValidateInline(agent ?? throw new AgentRequestException("'agents' must contain agent definitions.")));
+        var names = selection.Models ?? [];
+        if (selection.Model is { } model) names = [.. names, model];
+        agents.AddRange(await catalog.ResolveAsync(names, cancellationToken));
         if (agents.Count == 0)
             throw new AgentRequestException("Select at least one agent using 'model', 'models', 'agent', or 'agents'.");
         var workflow = AgentWorkflow.Validate(selection.WorkflowType ?? selection.WorkflowTypeSnakeCase,
@@ -56,6 +56,12 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
             Temperature = (float?)request.Temperature,
             TopP = (float?)request.TopP
         });
+    }
+
+    private static AgentDefinition ValidateInline(AgentDefinition agent)
+    {
+        AgentRuntime.Validate(agent);
+        return agent;
     }
 
     private static void RejectFields(JsonElement body, params string[] names)

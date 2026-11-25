@@ -1,0 +1,106 @@
+{
+    "name": "AnthropicAgent",
+    "description": "Has access to all common Anthropic capabilities.",
+    "instructions": "You are Anthropic Agent.",
+    "owned_by": "Provider",
+    "model": {
+        "id": "anthropic/claude-sonnet-5-5",
+        "providerHeaders": {
+            "anthropic-beta": "advisor-tool-2026-03-01"
+        },
+        "providerMetadata": {
+            "tools": [
+                {
+                    "name": "code_execution",
+                    "allowed_callers": [
+                        "direct"
+                    ],
+                    "type": "code_execution_20260521"
+                },
+                {
+                    "name": "web_fetch",
+                    "type": "web_fetch_20260318",
+                    "max_uses": 5,
+                    "allowed_domains": null,
+                    "blocked_domains": null,
+                    "citations": {
+                        "enabled": true
+                    },
+                    "allowed_callers": [
+                        "direct"
+                    ]
+                },
+                {
+                    "name": "web_search",
+                    "type": "web_search_20260318",
+                    "max_uses": 5,
+                    "allowed_callers": [
+                        "direct"
+                    ],
+                    "allowed_domains": null,
+                    "blocked_domains": null,
+                    "user_location": null
+                },
+                {
+                    "name": "advisor",
+                    "type": "advisor_20260301",
+                    "model": "claude-opus-5-5",
+                    "max_uses": 3,
+                    "max_tokens": 8192,
+                    "allowed_callers": [
+                        "direct"
+                    ]
+                }
+            ],
+            "max_tokens": 128000,
+            "thinking": {
+                "type": "adaptive",
+                "display": "summarized"
+            },
+            "output_config": {
+                "effort": "high"
+            },
+            "container": {
+                "skills": [
+                    {
+                        "skill_id": "pptx",
+                        "type": "anthropic",
+                        "version": "latest"
+                    },
+                    {
+                        "skill_id": "xlsx",
+                        "type": "anthropic",
+                        "version": "latest"
+                    },
+                    {
+                        "skill_id": "docx",
+                        "type": "anthropic",
+                        "version": "latest"
+                    },
+                    {
+                        "skill_id": "pdf",
+                        "type": "anthropic",
+                        "version": "latest"
+                    }
+                ]
+            }
+        }
+    },
+    "mcpClient": {
+        "capabilities": {},
+        "policy": {
+            "readOnlyHint": false,
+            "openWorldHint": true,
+            "idempotentHint": false,
+            "destructiveHint": true
+        }
+    },
+    "evaluations": {
+        "localEvaluator": {
+            "nonEmpty": {
+                "minLength": 1
+            },
+            "hasImageContent": false
+        }
+    }
+}

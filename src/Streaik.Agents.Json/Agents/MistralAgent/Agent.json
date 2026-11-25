@@ -1,0 +1,42 @@
+{
+  "name": "MistralAgent",
+  "description": "Has access to all Mistral capabilities.",
+  "instructions": "You are MistralAgent.",
+  "owned_by": "Provider",
+  "model": {
+    "id": "mistral/mistral-medium-3-5",
+    "providerMetadata": {
+      "tools": [
+        {
+          "type": "web_search_premium"
+        },
+        {
+          "type": "image_generation"
+        },
+        {
+          "type": "code_interpreter"
+        }
+      ],
+      "completion_args": {
+        "reasoning_effort": "high"
+      }
+    }
+  },
+  "transcription": {
+    "id": "mistral/voxtral-mini-transcribe-realtime-3"
+  },
+  "speech": {
+    "model": {
+      "id": "mistral/voxtral-mini-tts-3-0"
+    }
+  },
+  "mcpClient": {
+    "capabilities": {},
+    "policy": {
+      "readOnlyHint": false,
+      "openWorldHint": true,
+      "idempotentHint": false,
+      "destructiveHint": true
+    }
+  }
+}

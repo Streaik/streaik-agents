@@ -76,13 +76,15 @@ public sealed class AgentEndpointTests
         });
     }
 
-    [Fact]
-    public async Task Inline_transport_streams_ordered_responses_events_and_maps_history()
+    [Theory]
+    [InlineData("v1/responses")]
+    [InlineData("responses")]
+    public async Task Inline_transport_streams_ordered_responses_events_and_maps_history(string transport)
     {
         await using var host = await TestAgentHost.StartAsync();
         using var request = TestAgentHost.Post(Responses, new
         {
-            agent = new { name = "Inline", model = new { id = "openai/test" }, instructions = "Agent instructions", transport = "responses" },
+            agent = new { name = "Inline", model = new { id = "openai/test" }, instructions = "Agent instructions", transport },
             input = new[] { new { role = "user", content = "Q1" }, new { role = "assistant", content = "A1" }, new { role = "user", content = "Q2" } },
             instructions = "Turn instructions",
             stream = true,
@@ -104,6 +106,7 @@ public sealed class AgentEndpointTests
         Assert.Equal("Hello there", OutputText(completed));
         Assert.Equal(7, completed.GetProperty("usage").GetProperty("total_tokens").GetInt32());
         var call = Assert.Single(host.Gateway.Calls);
+        Assert.Equal("/base/v1/responses", call.Endpoint.AbsolutePath);
         Assert.Equal("explicit-key", call.Headers["x-openai-key"]);
         Assert.Equal("Agent instructions", call.Body.GetProperty("instructions").GetString());
         Assert.Equal(50, call.Body.GetProperty("max_output_tokens").GetInt32());
@@ -113,8 +116,8 @@ public sealed class AgentEndpointTests
     }
 
     [Theory]
-    [InlineData("messages")]
-    [InlineData("chat/completions")]
+    [InlineData("v1/messages")]
+    [InlineData("v1/chat/completions")]
     [InlineData("")]
     public async Task Unsupported_transports_are_rejected_before_streaming_or_inference(string transport)
     {
@@ -134,6 +137,8 @@ public sealed class AgentEndpointTests
     [InlineData("/v1/responses", "{\"model\":\"GreetingAgent\",\"input\":\"Hi\",\"previous_response_id\":\"resp_1\"}", HttpStatusCode.BadRequest)]
     [InlineData("/v1/responses", "{\"model\":\"MissingAgent\",\"input\":\"Hi\"}", HttpStatusCode.NotFound)]
     [InlineData("/v1/responses", "{\"model\":\"GreetingAgent\",\"input\":\"Hi\",\"agent\":{}}", HttpStatusCode.BadRequest)]
+    [InlineData("/v1/responses", """{"agent":{"name":"Inline","models":[{"id":"openai/test"}]},"input":"Hi"}""", HttpStatusCode.BadRequest)]
+    [InlineData("/v1/responses", """{"agent":{"name":"Inline","model":{"id":"openai/test","providerMetadata":{}}},"input":"Hi"}""", HttpStatusCode.BadRequest)]
     [InlineData("/api/chat", "{\"agents\":[{},{}],\"messages\":[]}", HttpStatusCode.BadRequest)]
     public async Task Unsupported_routing_shapes_are_not_silently_ignored(string path, string json, HttpStatusCode status)
     {

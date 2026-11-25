@@ -10,14 +10,14 @@ public static class AgentHosting
 
     public static IServiceCollection AddStreaikAgents(this IServiceCollection services, IConfigurationSection configuration)
     {
-        var endpoint = configuration["GatewayEndpoint"];
-        if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var gateway) || gateway.Host.Length == 0
+        var gatewayBaseUrl = configuration["GatewayEndpoint"];
+        if (!Uri.TryCreate(gatewayBaseUrl, UriKind.Absolute, out var gateway) || gateway.Host.Length == 0
             || (gateway.Scheme != Uri.UriSchemeHttps && !(gateway.Scheme == Uri.UriSchemeHttp && gateway.IsLoopback))
             || gateway.UserInfo.Length != 0 || gateway.Query.Length != 0 || gateway.Fragment.Length != 0)
-            throw new InvalidOperationException("Configure an HTTPS GatewayEndpoint (HTTP is allowed only on loopback).");
+            throw new InvalidOperationException("Configure GatewayEndpoint as the shared HTTPS gateway base URL (HTTP is allowed only on loopback).");
 
         var baseAddress = new Uri(gateway.AbsoluteUri.TrimEnd('/') + "/");
-        services.AddSingleton(new AgentCatalog(configuration.GetSection("Agents").Get<AgentDefinition[]>() ?? []));
+        services.AddSingleton<AgentCatalog>();
         services.AddHttpClient(GatewayClientName, client => client.BaseAddress = baseAddress)
             .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false, UseCookies = false });
         services.AddScoped(services => new AgentRuntime(services.GetRequiredService<IHttpClientFactory>().CreateClient(GatewayClientName)));

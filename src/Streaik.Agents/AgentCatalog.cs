@@ -1,20 +1,51 @@
 namespace Streaik.Agents;
 
-public sealed class AgentCatalog(IEnumerable<AgentDefinition> definitions)
+public interface IAgentSource
 {
-    private readonly Dictionary<string, AgentDefinition> _agents = definitions.ToDictionary(
-        agent => !string.IsNullOrWhiteSpace(agent.Name) ? agent.Name
-            : throw new ArgumentException("Every configured agent must have a name."),
-        StringComparer.OrdinalIgnoreCase);
+    Task<IReadOnlyList<AgentDefinition>> GetAgentsAsync(CancellationToken cancellationToken = default);
+}
 
-    public AgentDefinition Resolve(string? name, AgentDefinition? inline)
+public sealed class AgentCatalog(IEnumerable<IAgentSource> sources)
+{
+    private readonly IAgentSource[] _sources = sources.ToArray();
+
+    public async Task<IReadOnlyList<AgentDefinition>> ResolveAsync(IReadOnlyList<string?> names,
+        CancellationToken cancellationToken = default)
     {
-        if ((name is null) == (inline is null) || (name is not null && string.IsNullOrWhiteSpace(name)))
-            throw new AgentRequestException("Provide exactly one of 'model' (a named agent) or 'agent' (an inline definition).");
+        cancellationToken.ThrowIfCancellationRequested();
+        if (names.Count == 0) return [];
+        if (names.Any(string.IsNullOrWhiteSpace))
+            throw new AgentRequestException("'model' and 'models' must contain nonempty agent names.");
 
-        var agent = inline ?? (_agents.TryGetValue(name!, out var configured) ? configured
-            : throw new AgentRequestException("The named agent was not found.", "agent_not_found"));
-        AgentRuntime.Validate(agent);
-        return agent;
+        var merged = new Dictionary<string, AgentDefinition>(StringComparer.OrdinalIgnoreCase);
+        foreach (var source in _sources)
+        {
+            IReadOnlyList<AgentDefinition> agents;
+            try
+            {
+                agents = await source.GetAgentsAsync(cancellationToken);
+            }
+            catch (Exception error) when (!cancellationToken.IsCancellationRequested)
+            {
+                throw new AgentCatalogUnavailableException(error);
+            }
+
+            // Later registrations may override earlier definitions, as in AIHappey.
+            foreach (var agent in agents)
+                if (!string.IsNullOrWhiteSpace(agent.Name)) merged[agent.Name] = agent;
+        }
+
+        var resolved = new List<AgentDefinition>(names.Count);
+        foreach (var name in names)
+        {
+            if (!merged.TryGetValue(name!, out var agent))
+                throw new AgentRequestException("The named agent was not found.", "agent_not_found");
+            AgentRuntime.Validate(agent);
+            resolved.Add(agent);
+        }
+        return resolved;
     }
 }
+
+public sealed class AgentCatalogUnavailableException(Exception innerException)
+    : Exception("The agent catalog is unavailable.", innerException);

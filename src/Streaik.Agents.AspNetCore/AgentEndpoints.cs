@@ -38,7 +38,7 @@ public static class AgentEndpoints
                 await ErrorAsync(context, 415, "invalid_request", "Send the request as JSON.");
                 return;
             }
-            input = AgentInput.Parse(await context.Request.ReadFromJsonAsync<JsonElement>(ct), catalog, ui);
+            input = await AgentInput.ParseAsync(await context.Request.ReadFromJsonAsync<JsonElement>(ct), catalog, ui, ct);
         }
         catch (AgentRequestException error)
         {
@@ -48,6 +48,11 @@ public static class AgentEndpoints
         catch (JsonException)
         {
             await ErrorAsync(context, 400, "invalid_request", "The request contains malformed JSON or unsupported fields.");
+            return;
+        }
+        catch (AgentCatalogUnavailableException)
+        {
+            await ErrorAsync(context, 503, "agent_catalog_unavailable", "The agent catalog is unavailable.");
             return;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }

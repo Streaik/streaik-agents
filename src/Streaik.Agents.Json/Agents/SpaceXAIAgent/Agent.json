@@ -1,0 +1,52 @@
+{
+    "name": "SpaceXAIAgent",
+    "description": "Has access to all default SpaceXAI capabilities.",
+    "instructions": "You are SpaceXAIAgent.",
+    "owned_by": "Provider",
+    "model": {
+        "id": "spacexai/grok-4.7",
+        "providerMetadata": {
+            "tools": [
+                {
+                    "type": "web_search",
+                    "allowed_domains": [],
+                    "excluded_domains": [],
+                    "enable_image_understanding": true,
+                    "enable_image_search ": true
+                },
+                {
+                    "type": "x_search",
+                    "enable_image_understanding": true,
+                    "enable_video_understanding": true,
+                    "allowed_x_handles": [],
+                    "excluded_x_handles": []
+                },
+                {
+                    "type": "code_execution"
+                },
+                {
+                    "type": "image_generation",
+                    "action": "auto"
+                }
+            ],
+            "include": [
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources",
+                "code_interpreter_call.outputs"
+            ],
+            "reasoning": {
+                "effort": "high"
+            },
+            "parallel_tool_calls": true
+        }
+    },
+    "mcpClient": {
+        "capabilities": {},
+        "policy": {
+            "readOnlyHint": false,
+            "openWorldHint": true,
+            "idempotentHint": false,
+            "destructiveHint": true
+        }
+    }
+}

@@ -5,6 +5,8 @@ namespace Streaik.Agents;
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed class AgentDefinition
 {
+    internal const string DefaultTransport = "v1/responses";
+
     [JsonPropertyName("name")]
     public string? Name { get; init; }
 
@@ -19,7 +21,7 @@ public sealed class AgentDefinition
 
     [JsonPropertyName("transport")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? Transport { get; init; }
+    public string? Transport { get; init; } = DefaultTransport;
 }
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]

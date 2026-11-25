@@ -14,7 +14,7 @@ internal sealed class ResponsesChatClient(HttpClient gateway, string model, IRea
         CancellationToken cancellationToken = default)
     {
         var result = await gateway.GetResponses(CreateRequest(messages, options, stream: false), providerId: null,
-            headers: headers, ct: cancellationToken);
+            relativeUrl: AgentDefinition.DefaultTransport, headers: headers, ct: cancellationToken);
         CheckResult(result);
         var calls = GetFunctionCalls(result, options).ToList();
         var contents = new List<AIContent>();
@@ -36,7 +36,7 @@ internal sealed class ResponsesChatClient(HttpClient gateway, string model, IRea
     {
         var hasText = false;
         await foreach (var part in gateway.GetResponsesUpdates(CreateRequest(messages, options, stream: true),
-            providerId: string.Empty, headers: headers, ct: cancellationToken))
+            providerId: string.Empty, relativeUrl: AgentDefinition.DefaultTransport, headers: headers, ct: cancellationToken))
         {
             switch (part)
             {

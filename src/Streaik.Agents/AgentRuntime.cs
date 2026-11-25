@@ -5,8 +5,6 @@ namespace Streaik.Agents;
 
 public sealed partial class AgentRuntime(HttpClient gateway)
 {
-    private const string Responses = "responses";
-
     public static string GetProvider(AgentDefinition agent)
     {
         var id = agent.Model?.Id;
@@ -27,10 +25,10 @@ public sealed partial class AgentRuntime(HttpClient gateway)
         _ = GetTransport(agent);
     }
 
-    private static string GetTransport(AgentDefinition agent) => (agent.Transport ?? Responses) switch
+    private static string GetTransport(AgentDefinition agent) => agent.Transport switch
     {
-        Responses => Responses,
-        _ => throw new AgentRequestException("Unsupported agent 'transport'. Only 'responses' is supported.", "unsupported_transport")
+        null or "responses" or AgentDefinition.DefaultTransport => AgentDefinition.DefaultTransport,
+        _ => throw new AgentRequestException("Unsupported agent 'transport'. Only 'v1/responses' is supported.", "unsupported_transport")
     };
 
     public Task<AgentResponse> RunAsync(AgentDefinition definition, IEnumerable<ChatMessage> messages,
@@ -51,7 +49,7 @@ public sealed partial class AgentRuntime(HttpClient gateway)
         Validate(definition);
         IChatClient client = GetTransport(definition) switch
         {
-            Responses => new ResponsesChatClient(gateway, definition.Model!.Id!, gatewayHeaders, defaults, observeUsage),
+            AgentDefinition.DefaultTransport => new ResponsesChatClient(gateway, definition.Model!.Id!, gatewayHeaders, defaults, observeUsage),
             _ => throw new InvalidOperationException("Agent transport was not registered.")
         };
         return new ChatClientAgent(client, instructions: definition.Instructions,

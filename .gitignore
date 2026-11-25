@@ -42,6 +42,7 @@ dist/
 **/fakton/
 **/Docs/
 scripts/
+!samples/Streaik.Agents.HeaderAuth/appsettings.Production.json
 
 # Build results
 [Dd]ebug/

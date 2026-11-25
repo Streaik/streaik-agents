@@ -13,5 +13,7 @@
     <ProjectReference Include="../../../streaik-responses/src/Streaik.Responses/Streaik.Responses.csproj" />
     <ProjectReference Include="../../../streaik-vercel/src/Streaik.Vercel/Streaik.Vercel.csproj" />
     <InternalsVisibleTo Include="Streaik.Agents.AspNetCore" />
+    <InternalsVisibleTo Include="Streaik.Agents.Json" />
+    <InternalsVisibleTo Include="Streaik.Agents.Blob" />
   </ItemGroup>
 </Project>
