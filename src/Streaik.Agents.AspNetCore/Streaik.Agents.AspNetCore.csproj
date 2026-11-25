@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Description>ASP.NET Core endpoints for the Streaik agent runtime.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="../Streaik.Agents/Streaik.Agents.csproj" />
+    <ProjectReference Include="../../../streaik-vercel/src/Streaik.Vercel/Streaik.Vercel.csproj" />
+  </ItemGroup>
+</Project>

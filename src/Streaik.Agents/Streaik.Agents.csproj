@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Description>Stateless Streaik agent runtime built on Microsoft Agent Framework.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <PackageReference Include="Microsoft.Agents.AI" Version="1.28.0" />
+    <ProjectReference Include="../../../streaik-responses/src/Streaik.Responses/Streaik.Responses.csproj" />
+  </ItemGroup>
+</Project>
