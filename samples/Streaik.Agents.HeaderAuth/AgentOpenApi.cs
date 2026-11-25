@@ -9,18 +9,31 @@ namespace Streaik.Agents.HeaderAuth;
 
 internal static class AgentOpenApi
 {
+    private const string CapabilityDocumentName = "capabilities";
     private const string ProviderAuth = "Use x-<provider>-key for each provider called, including the decision model. "
         + "Authorization: Bearer <provider API key> is accepted as a fallback only when all selected models use one provider.";
     private const string Routing = "Select catalog agents with model/models, or provide full inline definitions with agent/agents. "
         + "Multiple participants default to sequential. Input is text only; runs are stateless.";
 
+    internal static void AddAgentOpenApi(this IServiceCollection services)
+    {
+        services.AddOpenApi(Configure);
+        services.AddOpenApi(CapabilityDocumentName, options =>
+        {
+            Configure(options);
+            options.AddDocumentTransformer(GroupCapabilitiesAsync);
+        });
+    }
+
     internal static void MapAgentReference(this WebApplication app)
     {
         app.MapOpenApi();
-        app.MapScalarApiReference(options => options.AddDocument("v1", "Streaik Agents", isDefault: true));
+        app.MapScalarApiReference(options => options
+            .AddDocument("v1", "By API family", isDefault: true)
+            .AddDocument(CapabilityDocumentName, "By capability"));
     }
 
-    internal static void Configure(OpenApiOptions options)
+    private static void Configure(OpenApiOptions options)
     {
         options.AddDocumentTransformer((document, _, _) =>
         {
@@ -40,8 +53,8 @@ internal static class AgentOpenApi
         {
             if (context.Description.ActionDescriptor.EndpointMetadata.OfType<AgentRequestBodyMetadata>().LastOrDefault() is not { } body) return;
             var ui = body.Type == typeof(AgentChatRequest);
-            operation.Description = (ui ? "Returns AI SDK UI Message Stream events. Use workflowMetadata for workflow options. "
-                : "Returns a Responses object, or Responses SSE events when stream is true. Use workflow_metadata for workflow options. ") + Routing + " " + ProviderAuth;
+            operation.Description = (ui ? "Returns AI SDK UI Message Stream events. Use workflowType and workflowMetadata for workflow options. "
+                : "Returns a Responses object, or Responses SSE events when stream is true. Use workflow_type and workflow_metadata for workflow options. ") + Routing + " " + ProviderAuth;
             operation.RequestBody = new OpenApiRequestBody
             {
                 Required = true,
@@ -57,7 +70,7 @@ internal static class AgentOpenApi
                                 : """{"model":"GreetingAgent","input":"Say hi"}"""),
                             ["workflow"] = Example("Sequential inline workflow", ui
                                 ? """{"agents":[{"name":"Draft","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Write a draft."},{"name":"Review","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Review the draft."}],"workflowType":"sequential","messages":[{"id":"1","role":"user","parts":[{"type":"text","text":"Write a short welcome note"}]}]}"""
-                                : """{"agents":[{"name":"Draft","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Write a draft."},{"name":"Review","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Review the draft."}],"workflowType":"sequential","input":"Write a short welcome note"}""")
+                                : """{"agents":[{"name":"Draft","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Write a draft."},{"name":"Review","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Review the draft."}],"workflow_type":"sequential","input":"Write a short welcome note"}""")
                         }
                     }
                 }
@@ -72,23 +85,72 @@ internal static class AgentOpenApi
         });
         options.AddSchemaTransformer((schema, context, _) =>
         {
-            if (context.JsonTypeInfo.Type == typeof(ResponseInput))
+            var type = context.JsonTypeInfo.Type;
+            if (type == typeof(ResponseInput))
             {
                 schema.Type = null;
                 schema.AnyOf = [Text(), new OpenApiSchema { Type = JsonSchemaType.Array, Items = new OpenApiSchema { Type = JsonSchemaType.Object } }];
                 schema.Description = "User text, or an array of text-only Responses message items.";
             }
-            if (typeof(AgentSelection).IsAssignableFrom(context.JsonTypeInfo.Type) && schema.Properties is { } properties)
+
+            var workflowField = type == typeof(AgentChatRequest) ? AgentChatRequest.WorkflowTypeField
+                : type == typeof(AgentResponsesRequest) ? AgentResponsesRequest.WorkflowTypeField : null;
+            if (workflowField is not null && schema.Properties?.TryGetValue(workflowField, out var property) == true && property is OpenApiSchema workflow)
             {
-                foreach (var name in new[] { "workflowType", "workflow_type" })
-                    if (properties.TryGetValue(name, out var property) && property is OpenApiSchema workflow)
-                    {
-                        workflow.Enum = ["sequential", "concurrent", "handoff", "groupchat", "magentic", "decisions"];
-                        workflow.Default = JsonValue.Create("sequential");
-                    }
+                workflow.Enum = ["sequential", "concurrent", "handoff", "groupchat", "magentic", "decisions"];
+                workflow.Default = JsonValue.Create("sequential");
             }
             return Task.CompletedTask;
         });
+    }
+
+    private static Task GroupCapabilitiesAsync(OpenApiDocument document, OpenApiDocumentTransformerContext _, CancellationToken ct)
+    {
+        const string other = "Other";
+        var pathsByCapability = document.Paths.Where(path => path.Value.Operations is { Count: > 0 }).ToLookup(path => path.Key switch
+        {
+            "/v1/responses" or "/api/chat" => "Chat",
+            "/v1/models" => "LLM",
+            _ when path.Key.StartsWith("/v1/models/", StringComparison.Ordinal) => "LLM",
+            _ => other
+        });
+
+        var groups = new JsonArray();
+        document.Tags = new HashSet<OpenApiTag>();
+        foreach (var capability in new[] { "Chat", "LLM", other })
+        {
+            var sectionNames = new JsonArray();
+            var sections = pathsByCapability[capability].GroupBy(path => RoutePrefix(path.Key))
+                .OrderBy(section => section.Key switch { "/v1" => 0, "/api" => 1, _ => 2 })
+                .ThenBy(section => section.Key, StringComparer.Ordinal);
+            foreach (var section in sections)
+            {
+                // Tags must be unique in the document, even when Scalar displays the same prefix in different groups.
+                var name = $"{capability} {section.Key}";
+                document.Tags.Add(new OpenApiTag
+                {
+                    Name = name,
+                    Extensions = new Dictionary<string, IOpenApiExtension>
+                    {
+                        ["x-displayName"] = new JsonNodeExtension(JsonValue.Create(section.Key)!)
+                    }
+                });
+                sectionNames.Add(name);
+                foreach (var path in section)
+                    foreach (var operation in path.Value.Operations!.Values)
+                        operation.Tags = new HashSet<OpenApiTagReference> { new(name, document) };
+            }
+            if (sectionNames.Count > 0)
+                groups.Add(new JsonObject { ["name"] = capability, ["tags"] = sectionNames });
+        }
+        (document.Extensions ??= new Dictionary<string, IOpenApiExtension>())["x-tagGroups"] = new JsonNodeExtension(groups);
+        return Task.CompletedTask;
+    }
+
+    private static string RoutePrefix(string path)
+    {
+        var separator = path.IndexOf('/', 1);
+        return separator < 0 ? path : path[..separator];
     }
 
     private static OpenApiSchema Text() => new() { Type = JsonSchemaType.String };

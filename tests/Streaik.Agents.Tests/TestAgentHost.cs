@@ -74,7 +74,7 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
         {
             builder.Services.AddSingleton<IAgentSource, JsonAgentSource>();
             builder.Services.AddScoped<IAgentGatewayHeaders, HeaderGatewayHeaders>();
-            builder.Services.AddOpenApi(AgentOpenApi.Configure);
+            builder.Services.AddAgentOpenApi();
         }
         builder.Services.AddSingleton<IAgentSource, TestAgentSource>();
         if (extraSource is not null) builder.Services.AddSingleton(extraSource);

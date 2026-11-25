@@ -17,12 +17,12 @@ public static class AgentEndpoints
         AgentModelEndpoints.Map(endpoints);
         endpoints.MapPost("/api/chat", (HttpContext context, AgentCatalog catalog, AgentRuntime runtime) =>
             HandleAsync(context, catalog, runtime, ui: true))
-            .WithName("StreamAgentChat").WithTags("Agents").WithSummary("Stream agent chat")
+            .WithName("StreamAgentChat").WithTags("Vercel")
             .WithMetadata(new AgentRequestBodyMetadata(typeof(AgentChatRequest)))
             .Produces<string>(200, "text/event-stream");
         endpoints.MapPost("/v1/responses", (HttpContext context, AgentCatalog catalog, AgentRuntime runtime) =>
             HandleAsync(context, catalog, runtime, ui: false))
-            .WithName("CreateAgentResponse").WithTags("Agents").WithSummary("Create an agent response")
+            .WithName("CreateAgentResponse").WithTags("OpenAI")
             .WithMetadata(new AgentRequestBodyMetadata(typeof(AgentResponsesRequest)))
             .Produces<ResponseResult>(200, "application/json", "text/event-stream");
         return endpoints;

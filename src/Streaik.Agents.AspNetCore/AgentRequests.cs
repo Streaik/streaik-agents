@@ -13,21 +13,28 @@ internal abstract class AgentSelection
     public IReadOnlyList<string?>? Models { get; init; }
     public AgentDefinition? Agent { get; init; }
     public IReadOnlyList<AgentDefinition?>? Agents { get; init; }
-    public string? WorkflowType { get; init; }
-    [JsonPropertyName("workflow_type")]
-    public string? WorkflowTypeSnakeCase { get; init; }
 }
 
 internal sealed class AgentChatRequest : AgentSelection
 {
-    [JsonPropertyName("workflowMetadata")]
+    internal const string WorkflowTypeField = "workflowType";
+    internal const string WorkflowMetadataField = "workflowMetadata";
+
+    [JsonPropertyName(WorkflowTypeField)]
+    public string? WorkflowType { get; init; }
+    [JsonPropertyName(WorkflowMetadataField)]
     public WorkflowMetadata? WorkflowMetadata { get; init; }
     public required UIMessage[] Messages { get; init; }
 }
 
 internal sealed class AgentResponsesRequest : AgentSelection
 {
-    [JsonPropertyName("workflow_metadata")]
+    internal const string WorkflowTypeField = "workflow_type";
+    internal const string WorkflowMetadataField = "workflow_metadata";
+
+    [JsonPropertyName(WorkflowTypeField)]
+    public string? WorkflowType { get; init; }
+    [JsonPropertyName(WorkflowMetadataField)]
     public WorkflowMetadata? WorkflowMetadata { get; init; }
     public required ResponseInput Input { get; init; }
     public bool? Stream { get; init; }

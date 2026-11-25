@@ -133,7 +133,7 @@ public sealed class AgentEndpointTests
     }
 
     [Theory]
-    [InlineData("/v1/responses", "{\"model\":\"GreetingAgent\",\"input\":\"Hi\",\"workflowType\":\"unknown\"}", HttpStatusCode.BadRequest)]
+    [InlineData("/v1/responses", "{\"model\":\"GreetingAgent\",\"input\":\"Hi\",\"workflow_type\":\"unknown\"}", HttpStatusCode.BadRequest)]
     [InlineData("/v1/responses", "{\"model\":\"GreetingAgent\",\"input\":\"Hi\",\"previous_response_id\":\"resp_1\"}", HttpStatusCode.BadRequest)]
     [InlineData("/v1/responses", "{\"model\":\"MissingAgent\",\"input\":\"Hi\"}", HttpStatusCode.NotFound)]
     [InlineData("/v1/responses", "{\"model\":\"GreetingAgent\",\"input\":\"Hi\",\"agent\":{}}", HttpStatusCode.BadRequest)]

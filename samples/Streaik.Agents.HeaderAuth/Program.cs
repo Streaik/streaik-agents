@@ -7,7 +7,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddStreaikAgents(builder.Configuration.GetSection("StreaikAgents"));
 builder.Services.AddSingleton<IAgentSource, JsonAgentSource>();
 builder.Services.AddScoped<IAgentGatewayHeaders, HeaderGatewayHeaders>();
-builder.Services.AddOpenApi(AgentOpenApi.Configure);
+builder.Services.AddAgentOpenApi();
 
 var app = builder.Build();
 app.MapStreaikAgents();

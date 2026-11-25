@@ -10,18 +10,19 @@ internal sealed record AgentWorkflow(string Type, WorkflowMetadata? Metadata, st
     public AgentDefinition? Router => Metadata?.Decisions is { } decision && Type == "decisions"
         ? new() { Name = "Decisions router", Model = new AgentModel { Id = decision.Model } } : null;
 
-    public static AgentWorkflow Validate(string? type, WorkflowMetadata? metadata, IReadOnlyList<AgentDefinition> agents, string metadataField)
+    public static AgentWorkflow Validate(string? type, WorkflowMetadata? metadata, IReadOnlyList<AgentDefinition> agents,
+        string typeField, string metadataField)
     {
         type ??= "sequential";
         if (!SupportedTypes.Contains(type))
-            throw new AgentRequestException("Unknown 'workflowType'. Use sequential, concurrent, handoff, groupchat, magentic, or decisions.");
+            throw new AgentRequestException($"Unknown '{typeField}'. Use sequential, concurrent, handoff, groupchat, magentic, or decisions.");
         if (type != "decisions" && agents.Select(agent => agent.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count() != agents.Count)
             throw new AgentRequestException("Agent names in a workflow must be unique.");
         if (metadata is not null && (metadata.Decisions is not null && type != "decisions"
             || metadata.Groupchat is not null && type != "groupchat"
             || metadata.Handoff is not null && type != "handoff"
             || metadata.Magentic is not null && type != "magentic"))
-            throw new AgentRequestException($"'{metadataField}' must match 'workflowType'.");
+            throw new AgentRequestException($"'{metadataField}' must match '{typeField}'.");
 
         var workflow = new AgentWorkflow(type, metadata, metadataField);
         switch (type)

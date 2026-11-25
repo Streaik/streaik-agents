@@ -15,10 +15,10 @@ internal static class AgentModelEndpoints
     public static void Map(IEndpointRouteBuilder endpoints)
     {
         endpoints.MapGet(ModelPath, ListAsync)
-            .WithName("ListAgentModels").WithTags("Agents").WithSummary("List agent models without their definitions")
+            .WithName("ListAgentModels").WithTags("OpenAI").WithDescription("List agent models without their definitions.")
             .Produces<AgentModelList>().Produces(503);
         endpoints.MapGet(ModelPath + "/{**modelId}", RetrieveAsync)
-            .WithName("RetrieveAgentModel").WithTags("Agents").WithSummary("Retrieve one agent model and its definition")
+            .WithName("RetrieveAgentModel").WithTags("OpenAI").WithDescription("Retrieve one agent model and its definition.")
             .Produces<AgentModelEntry>().Produces(404).Produces(503);
     }
 

@@ -49,7 +49,7 @@ curl "https://agents.streaik.net/v1/responses" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{
     "models": ["GoogleSearchAgent", "OpenAIAgent"],
-    "workflowType": "sequential"
+    "workflow_type": "sequential"
     "input": "Say hi"
   }'
 ```

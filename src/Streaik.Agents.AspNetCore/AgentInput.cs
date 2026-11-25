@@ -15,10 +15,12 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
         if (body.ValueKind != JsonValueKind.Object)
             throw new AgentRequestException("The request body must be a JSON object.");
 
-        var metadataField = ui ? "workflowMetadata" : "workflow_metadata";
-        var wrongSpelling = ui ? "workflow_metadata" : "workflowMetadata";
-        if (body.EnumerateObject().Any(field => field.Name.Equals(wrongSpelling, StringComparison.OrdinalIgnoreCase)))
-            throw new AgentRequestException($"Use '{metadataField}' on this endpoint, not '{wrongSpelling}'.");
+        var chatFields = (AgentChatRequest.WorkflowTypeField, AgentChatRequest.WorkflowMetadataField);
+        var responsesFields = (AgentResponsesRequest.WorkflowTypeField, AgentResponsesRequest.WorkflowMetadataField);
+        var (typeField, metadataField) = ui ? chatFields : responsesFields;
+        var (alternateTypeField, alternateMetadataField) = ui ? responsesFields : chatFields;
+        RejectAlternateField(body, typeField, alternateTypeField);
+        RejectAlternateField(body, metadataField, alternateMetadataField);
 
         RejectFields(body, "workflowFile", "workflow_file",
             "conversation", "previous_response_id", "tool_choice", "toolChoice");
@@ -29,8 +31,9 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
             && !(tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() == 0))
             throw new AgentRequestException("Tools are not supported in v1.");
 
-        AgentSelection selection = ui ? body.Deserialize<AgentChatRequest>(WebJson)! : body.Deserialize<AgentResponsesRequest>(WebJson)!;
-        var metadata = selection is AgentChatRequest chatRequest ? chatRequest.WorkflowMetadata : ((AgentResponsesRequest)selection).WorkflowMetadata;
+        var chat = ui ? body.Deserialize<AgentChatRequest>(WebJson) : null;
+        var responses = ui ? null : body.Deserialize<AgentResponsesRequest>(WebJson);
+        AgentSelection selection = chat is not null ? chat : responses!;
         var agents = new List<AgentDefinition>();
         if (selection.Agent is { } inline) agents.Add(ValidateInline(inline));
         foreach (var agent in selection.Agents ?? [])
@@ -40,12 +43,13 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
         agents.AddRange(await catalog.ResolveAsync(names, cancellationToken));
         if (agents.Count == 0)
             throw new AgentRequestException("Select at least one agent using 'model', 'models', 'agent', or 'agents'.");
-        var workflow = AgentWorkflow.Validate(selection.WorkflowType ?? selection.WorkflowTypeSnakeCase, metadata, agents, metadataField);
+        var workflow = AgentWorkflow.Validate(chat?.WorkflowType ?? responses?.WorkflowType,
+            chat?.WorkflowMetadata ?? responses?.WorkflowMetadata, agents, typeField, metadataField);
 
-        if (selection is AgentChatRequest chat)
+        if (chat is not null)
             return new AgentInput(agents, workflow, ValidateMessages(chat.Messages?.Select(MapUiMessage)), Stream: true);
 
-        var request = (AgentResponsesRequest)selection;
+        var request = responses!;
         // Run instructions supplement, rather than replace, the selected agent's instructions.
         var history = MapResponseInput(request.Input);
         if (!string.IsNullOrWhiteSpace(request.Instructions))
@@ -64,6 +68,12 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
     {
         AgentRuntime.Validate(agent);
         return agent;
+    }
+
+    private static void RejectAlternateField(JsonElement body, string name, string alternate)
+    {
+        if (body.EnumerateObject().Any(field => field.Name.Equals(alternate, StringComparison.OrdinalIgnoreCase)))
+            throw new AgentRequestException($"Use '{name}' on this endpoint, not '{alternate}'.");
     }
 
     private static void RejectFields(JsonElement body, params string[] names)

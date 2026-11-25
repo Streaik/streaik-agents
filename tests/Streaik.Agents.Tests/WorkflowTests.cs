@@ -33,7 +33,7 @@ public sealed class WorkflowTests
             Assert.Equal(64, call.Body.GetProperty("max_output_tokens").GetInt32());
             Assert.Equal("same-provider-key", Assert.Single(Credentials(call)).Value);
             Assert.False(call.Body.TryGetProperty("models", out _));
-            Assert.False(call.Body.TryGetProperty("workflowType", out _));
+            Assert.False(call.Body.TryGetProperty("workflow_type", out _));
         });
     }
 
@@ -124,7 +124,7 @@ public sealed class WorkflowTests
         };
         using var request = TestAgentHost.Post("/v1/responses", new
         {
-            models = new[] { "GreetingAgent", "ReviewAgent" }, workflowType = "handoff", input = "Hi", stream,
+            models = new[] { "GreetingAgent", "ReviewAgent" }, workflow_type = "handoff", input = "Hi", stream,
             workflow_metadata = new { handoff = new { handoffs = new object[][] { ["GreetingAgent", new[] { "ReviewAgent" }] } } }
         }, "test-key");
         using var response = await host.Client.SendAsync(request);
@@ -160,7 +160,7 @@ public sealed class WorkflowTests
         };
         using var request = TestAgentHost.Post("/v1/responses", new
         {
-            models = new[] { "GreetingAgent", "ReviewAgent" }, workflowType = "magentic", input = "Ask the team to review this draft.", stream = true,
+            models = new[] { "GreetingAgent", "ReviewAgent" }, workflow_type = "magentic", input = "Ask the team to review this draft.", stream = true,
             workflow_metadata = new { magentic = new { maxRounds = 4 } }
         }, "test-key");
         using var response = await host.Client.SendAsync(request);
@@ -186,7 +186,7 @@ public sealed class WorkflowTests
         using var request = TestAgentHost.Post("/v1/responses", new
         {
             models = new[] { "GreetingAgent" }, agent = new { name = "Unused", instructions = "private candidate instructions", model = new { id = "anthropic/unused" } },
-            workflowType = "decisions", workflow_metadata = new { decisions = new { model = "fireworks/router" } }, input = "Hi"
+            workflow_type = "decisions", workflow_metadata = new { decisions = new { model = "fireworks/router" } }, input = "Hi"
         }, "never-fan-out");
         request.Headers.Add("x-fireworks-key", "router-only");
         request.Headers.Add("x-openai-key", "selected-only");
@@ -210,8 +210,8 @@ public sealed class WorkflowTests
     [Theory]
     [InlineData("""{"models":["GreetingAgent","Missing"],"input":"Hi"}""", HttpStatusCode.NotFound)]
     [InlineData("""{"models":["GreetingAgent","greetingagent"],"input":"Hi"}""", HttpStatusCode.BadRequest)]
-    [InlineData("""{"models":["GreetingAgent","ReviewAgent"],"workflowType":"handoff","workflow_metadata":{"handoff":{"handoffs":[["GreetingAgent",["Missing"]]]}},"input":"Hi"}""", HttpStatusCode.BadRequest)]
-    [InlineData("""{"models":["GreetingAgent","ReviewAgent"],"workflowType":"decisions","input":"Hi"}""", HttpStatusCode.BadRequest)]
+    [InlineData("""{"models":["GreetingAgent","ReviewAgent"],"workflow_type":"handoff","workflow_metadata":{"handoff":{"handoffs":[["GreetingAgent",["Missing"]]]}},"input":"Hi"}""", HttpStatusCode.BadRequest)]
+    [InlineData("""{"models":["GreetingAgent","ReviewAgent"],"workflow_type":"decisions","input":"Hi"}""", HttpStatusCode.BadRequest)]
     [InlineData("""{"models":["GreetingAgent","ReviewAgent"],"tools":[{"type":"function"}],"input":"Hi"}""", HttpStatusCode.BadRequest)]
     public async Task Invalid_workflows_never_call_the_gateway(string body, HttpStatusCode status)
     {
@@ -221,31 +221,23 @@ public sealed class WorkflowTests
         Assert.Empty(host.Gateway.Calls);
     }
 
-    [Fact]
-    public async Task Only_header_auth_has_openapi_and_scalar()
+    [Theory]
+    [InlineData("/v1/responses", "workflow_type", "workflowType")]
+    [InlineData("/api/chat", "workflowType", "workflow_type")]
+    public async Task Alternate_workflow_type_is_rejected_with_the_correct_spelling(string path, string expected, string alternate)
     {
         await using var host = await TestAgentHost.StartAsync();
-        var document = (await host.Client.GetFromJsonAsync<JsonNode>("/openapi/v1.json"))!;
-        var paths = document["paths"]!;
-        var responses = paths["/v1/responses"]!["post"]!;
-        var chat = paths["/api/chat"]!["post"]!;
-        Assert.NotNull(chat["responses"]!["200"]!["content"]!["text/event-stream"]);
-        Assert.NotNull(responses["responses"]!["200"]!["content"]!["application/json"]);
-        Assert.NotNull(responses["responses"]!["200"]!["content"]!["text/event-stream"]);
-        var request = responses["requestBody"]!["content"]!["application/json"]!;
-        Assert.Equal("sequential", request["examples"]!["workflow"]!["value"]!["workflowType"]!.GetValue<string>());
-        var schema = request["schema"]!;
-        if (schema["$ref"] is { } reference) schema = document["components"]!["schemas"]![reference.GetValue<string>().Split('/')[^1]]!;
-        Assert.Contains("decisions", schema["properties"]!["workflowType"]!["enum"]!.AsArray().Select(value => value!.GetValue<string>()));
-        Assert.NotNull(document["components"]!["securitySchemes"]!["providerBearer"]);
-        var scalar = await host.Client.GetStringAsync("/scalar");
-        Assert.Contains("scalar", scalar, StringComparison.OrdinalIgnoreCase);
+        var body = JsonNode.Parse(path == "/api/chat"
+            ? """{"model":"GreetingAgent","messages":[{"id":"1","role":"user","parts":[{"type":"text","text":"Hi"}]}]}"""
+            : """{"model":"GreetingAgent","input":"Hi"}""")!.AsObject();
+        body[alternate] = "concurrent";
+        using var request = TestAgentHost.Post(path, body, "test-key");
+        using var response = await host.Client.SendAsync(request);
 
-        await using var azure = await TestAgentHost.StartAsync(azure: true);
-        using var azureDocs = await azure.Client.GetAsync("/openapi/v1.json");
-        using var azureScalar = await azure.Client.GetAsync("/scalar");
-        Assert.Equal(HttpStatusCode.NotFound, azureDocs.StatusCode);
-        Assert.Equal(HttpStatusCode.NotFound, azureScalar.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var error = (await response.Content.ReadFromJsonAsync<JsonNode>())!["error"]!;
+        Assert.Equal($"Use '{expected}' on this endpoint, not '{alternate}'.", error["message"]!.GetValue<string>());
+        Assert.Empty(host.Gateway.Calls);
     }
 
     private static IEnumerable<KeyValuePair<string, string>> Credentials(GatewayCall call) => call.Headers.Where(header =>
