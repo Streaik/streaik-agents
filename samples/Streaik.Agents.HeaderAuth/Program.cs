@@ -9,7 +9,14 @@ builder.Services.AddSingleton<IAgentSource, JsonAgentSource>();
 builder.Services.AddScoped<IAgentGatewayHeaders, HeaderGatewayHeaders>();
 builder.Services.AddAgentOpenApi();
 
+builder.Services.AddCors(options => options.AddDefaultPolicy(policy => policy
+           .AllowAnyHeader()
+           .AllowAnyOrigin()
+           .AllowAnyMethod()
+            .WithExposedHeaders("WWW-Authenticate")));
+
 var app = builder.Build();
+app.UseCors();
 app.MapStreaikAgents();
 app.MapAgentReference();
 await app.RunAsync();
