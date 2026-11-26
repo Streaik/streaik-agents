@@ -70,12 +70,14 @@ public sealed partial class AgentRuntime(HttpClient gateway)
     private ChatClientAgent CreateAgent(AgentRunTarget target, ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null)
     {
         var definition = target.Definition;
+        var skills = target.Skills.Count > 0 ? new AgentSkillTools(target.Skills) : null;
         IChatClient client = GetTransport(definition) switch
         {
-            AgentDefinition.DefaultTransport => new ResponsesChatClient(gateway, target.Model, target.Headers, defaults, observeUsage),
+            AgentDefinition.DefaultTransport => new ResponsesChatClient(gateway, target.Model, target.Headers, defaults, observeUsage,
+                skillCatalog: skills?.Catalog()),
             _ => throw new InvalidOperationException("Agent transport was not registered.")
         };
         return new ChatClientAgent(client, instructions: definition.Instructions,
-            name: definition.Name, description: definition.Description);
+            name: definition.Name, description: definition.Description, tools: skills?.Functions());
     }
 }

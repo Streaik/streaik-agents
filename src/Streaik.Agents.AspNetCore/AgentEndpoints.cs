@@ -64,7 +64,8 @@ public static class AgentEndpoints
             var credentials = context.RequestServices.GetService<IAgentGatewayHeaders>();
             var participants = input.Agents;
             var router = participants.Count > 1 ? input.Workflow.Router : null;
-            var providers = (router is null ? participants : participants.Append(router)).SelectMany(AgentRuntime.PotentialProviders);
+            var providers = (router is null ? participants : participants.Append(router)).SelectMany(AgentRuntime.PotentialProviders)
+                .Concat(participants.SelectMany(AgentRuntime.SkillProviders));
             var singleProvider = providers.Distinct(StringComparer.Ordinal).Take(2).Count() == 1;
             var headerCache = new Dictionary<(AgentDefinition, AgentModel), IReadOnlyDictionary<string, string>>();
 

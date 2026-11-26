@@ -5,7 +5,8 @@ using Streaik.Vercel.Models;
 
 namespace Streaik.Agents;
 
-internal sealed record AgentRunTarget(AgentDefinition Definition, AgentModel Model, IReadOnlyDictionary<string, string> Headers);
+internal sealed record AgentRunTarget(AgentDefinition Definition, AgentModel Model, IReadOnlyDictionary<string, string> Headers,
+    IReadOnlyList<AgentSkillBundle> Skills);
 
 public sealed partial class AgentRuntime
 {
@@ -95,7 +96,8 @@ public sealed partial class AgentRuntime
                 answer = await SelectModelAsync(agent, router, candidates, catalog, messages, ModelHeaders(router, routerHeaders), ct) ?? answer;
 
             var headers = await headersFor(agent, answer, false) ?? EmptyHeaders;
-            targets.Add(new AgentRunTarget(agent, answer, ModelHeaders(answer, headers)));
+            var skills = await LoadSkillsAsync(agent, answer, headers, headersFor, ct);
+            targets.Add(new AgentRunTarget(agent, answer, ModelHeaders(answer, headers), skills));
         }
         ct.ThrowIfCancellationRequested();
         return targets;

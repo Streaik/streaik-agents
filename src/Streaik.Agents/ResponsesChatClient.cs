@@ -8,7 +8,7 @@ using Streaik.Responses.Streaming;
 namespace Streaik.Agents;
 
 internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, IReadOnlyDictionary<string, string>? headers,
-    ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null) : IChatClient
+    ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null, string? skillCatalog = null) : IChatClient
 {
     private static readonly HashSet<string> ProtectedFields = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -85,7 +85,8 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
         var request = new ResponseRequest
         {
             Model = model.Id,
-            Instructions = options?.Instructions,
+            Instructions = skillCatalog is null ? options?.Instructions : string.IsNullOrWhiteSpace(options?.Instructions)
+                ? skillCatalog : $"{options.Instructions}\n\n{skillCatalog}",
             Input = new ResponseInput(messages.SelectMany(MapMessage)),
             Temperature = options?.Temperature ?? defaults?.Temperature ?? model.Options?.Temperature,
             TopP = options?.TopP ?? defaults?.TopP,
