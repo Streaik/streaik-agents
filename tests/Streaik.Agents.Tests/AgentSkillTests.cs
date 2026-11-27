@@ -15,9 +15,31 @@ public sealed class AgentSkillTests
     private const string RemoteInstructions = "Use the notes from the reference.";
     private const string ResourceText = "Checklist reference content.";
 
+    [Fact]
+    public async Task Gateway_execution_uses_the_same_tools_array_without_loading_the_reference_on_the_agent()
+    {
+        await using var host = await TestAgentHost.StartAsync();
+        using var request = TestAgentHost.Post(Responses, new
+        {
+            input = "Make a plan.", agent = new { name = "SkillAgent", model = new { id = "openai/test" }, tools = new[]
+            {
+                new { type = "skills", execution = "server", skills = new[] { new { type = "skill_reference", skill_id = RemoteId } } }
+            } }
+        });
+        request.Headers.Add("x-openai-key", "answer-key");
+        using var response = await host.Client.SendAsync(request);
+        Assert.True(response.IsSuccessStatusCode, await response.Content.ReadAsStringAsync());
+        var sent = Assert.Single(host.Gateway.Calls).Body;
+        var tool = Assert.Single(sent.GetProperty("tools").EnumerateArray());
+        Assert.Equal("skills", tool.GetProperty("name").GetString());
+        Assert.Equal("skills", tool.GetProperty("type").GetString());
+        Assert.False(tool.TryGetProperty("execution", out _));
+        Assert.False(sent.TryGetProperty("hosted_tools", out _));
+    }
+
     [Theory]
     [InlineData(Chat, true, null)]
-    [InlineData(Responses, false, "v 2")]
+    [InlineData(Responses, false, "2")]
     [InlineData(Responses, true, "latest")]
     public async Task Agent_routes_discover_and_run_the_same_two_tools(string endpoint, bool stream, string? version)
     {
@@ -66,7 +88,8 @@ public sealed class AgentSkillTests
         var instructions = initial.GetProperty("instructions").GetString()!.Split("\n\n", StringSplitOptions.None);
         Assert.Equal(2, instructions.Length);
         Assert.Equal(ExistingInstructions, instructions[0]);
-        using var catalog = JsonDocument.Parse(instructions[1]);
+        Assert.Contains("activate_skill", instructions[1]);
+        using var catalog = JsonDocument.Parse(instructions[1][(instructions[1].IndexOf('\n') + 1)..]);
         Assert.Equal("skills", Assert.Single(catalog.RootElement.EnumerateObject()).Name);
         var skills = catalog.RootElement.GetProperty("skills").EnumerateArray().ToArray();
         Assert.Equal(2, skills.Length);
@@ -143,7 +166,8 @@ public sealed class AgentSkillTests
 
     private static HttpRequestMessage Request(string endpoint, bool stream, object[] skills)
     {
-        var agent = new { name = "SkillAgent", model = new { id = "openai/test" }, instructions = ExistingInstructions, skills };
+        var agent = new { name = "SkillAgent", model = new { id = "openai/test" }, instructions = ExistingInstructions,
+            tools = skills.Length == 0 ? null : new[] { new { type = "skills", skills } } };
         return TestAgentHost.Post(endpoint, endpoint == Chat ? new
         {
             agent, stream,

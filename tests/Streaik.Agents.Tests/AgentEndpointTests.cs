@@ -2,6 +2,8 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using Streaik.Tools;
 
 namespace Streaik.Agents.Tests;
 
@@ -15,6 +17,131 @@ public sealed class AgentEndpointTests
         messages = new[] { new { id = "user1", role = "user", parts = new[] { new { type = "text", text = "Say hi" } } } }
     };
     private static readonly object ResponseBody = new { model = "GreetingAgent", input = "Say hi" };
+
+    [Fact]
+    public async Task ApiChat_converts_a_real_provider_approval_in_process_and_uses_the_client_result()
+    {
+        var endpoint = new Uri("https://inventory.example.test/mcp");
+        var calls = 0;
+        await using var host = await TestAgentHost.StartAsync(azure: true, mcp: new HostedToolAccess(
+            (label, url, _, _) => ValueTask.FromResult(label == "inventory" && url == endpoint
+                ? new McpEndpointAccess { ToolNames = new HashSet<string> { "lookup" } } : null),
+            CreateMcpHandler: _ => new InventoryMcp(() => calls++)));
+        var request = JsonNode.Parse("""
+            {"id":"mcp-review-chat","agent":{"name":"Inventory","model":{"id":"openai/test"},"tools":[
+              {"type":"mcp","execution":"provider","server_label":"inventory","server_url":"https://inventory.example.test/mcp"}]},
+             "messages":[{"id":"u","role":"user","parts":[{"type":"text","text":"look up"}]}]}
+            """)!;
+        host.Gateway.Respond = call => GatewayFixture.Complete(call,
+            [new { type = "mcp_approval_request", id = "mcpr_native", server_label = "inventory", name = "lookup", arguments = "{}" }]);
+        using var first = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("alice")));
+        var events = Events(await first.Content.ReadAsStringAsync(), out _);
+        var approval = Assert.Single(events, part => EventType(part) == "tool-approval-request");
+        Assert.Equal(1, calls);
+        Assert.Equal("inventory result", approval.GetProperty("approvalDescriptor").GetProperty("output").GetProperty("content")[0].GetProperty("text").GetString());
+        Assert.DoesNotContain("inventory result", host.Gateway.Calls.Single().Body.GetRawText());
+        var id = approval.GetProperty("approvalId").GetString();
+        request["messages"]!.AsArray().Add(JsonNode.Parse($$$"""
+            {"id":"a","role":"assistant","parts":[{"type":"dynamic-tool","toolName":"streaik_mcp_result_review","toolCallId":"{{{id}}}",
+              "providerExecuted":true,"state":"approval-responded","input":{},"output":"client-selected result","approval":{"id":"{{{id}}}","approved":true}}]}
+            """));
+        host.Gateway.Respond = call => GatewayFixture.Text(call, "done");
+        using var wrongUser = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("bob")));
+        Assert.Equal(HttpStatusCode.BadRequest, wrongUser.StatusCode);
+        using var resumed = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("alice")));
+        Assert.Contains("done", await resumed.Content.ReadAsStringAsync());
+        var input = host.Gateway.Calls.Last().Body.GetProperty("input").GetRawText();
+        Assert.Contains("client-selected result", input);
+        Assert.DoesNotContain("inventory result", input);
+        Assert.Equal(1, calls);
+    }
+
+    private sealed class InventoryMcp(Action invoke) : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (request.Content is null) return new(HttpStatusCode.NoContent);
+            using var doc = JsonDocument.Parse(await request.Content.ReadAsStringAsync(cancellationToken));
+            if (!doc.RootElement.TryGetProperty("id", out var id)) return new(HttpStatusCode.Accepted);
+            var method = doc.RootElement.GetProperty("method").GetString();
+            if (method == "server/discover") return GatewayFixture.Reply($$$"""{"jsonrpc":"2.0","id":{{{id.GetRawText()}}},"error":{"code":-32601,"message":"Unknown method"}}""");
+            var result = method switch
+            {
+                "initialize" => """{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"inventory","version":"1"}}""",
+                "tools/list" => """{"tools":[{"name":"lookup","inputSchema":{"type":"object"}}]}""",
+                "tools/call" => """{"content":[{"type":"text","text":"inventory result"}]}""",
+                _ => throw new InvalidOperationException("Unexpected MCP method.")
+            };
+            if (method == "tools/call") invoke();
+            return GatewayFixture.Reply($$"""{"jsonrpc":"2.0","id":{{id.GetRawText()}},"result":{{result}}}""");
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Browser_calls_get_a_signed_approval_and_only_reviewed_output_is_forwarded(bool approved)
+    {
+        await using var host = await TestAgentHost.StartAsync();
+        var request = JsonNode.Parse("""
+            {"model":"GreetingAgent","id":"test-browser","tools":[{"name":"browser_lookup","inputSchema":{"type":"object"}}],
+             "messages":[{"id":"u","role":"user","parts":[{"type":"text","text":"look up"}]}]}
+            """)!;
+        host.Gateway.Respond = call => call.Body.GetProperty("input").EnumerateArray().Any(item =>
+            item.TryGetProperty("type", out var kind) && kind.ValueEquals("function_call_output"))
+            ? GatewayFixture.Text(call, "done") : GatewayFixture.Complete(call,
+            [new { type = "function_call", call_id = "call_browser", name = "browser_lookup", arguments = "{\"query\":\"q\"}" }]);
+        using var first = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, "alice-key"));
+        var events = Events(await first.Content.ReadAsStringAsync(), out _);
+        var call = Assert.Single(events, part => EventType(part) == "tool-input-available");
+        var approval = Assert.Single(events, part => EventType(part) == "tool-approval-request");
+        Assert.False(call.GetProperty("providerExecuted").GetBoolean());
+        Assert.Equal("call_browser", approval.GetProperty("toolCallId").GetString());
+        var invocation = new JsonObject { ["type"] = "dynamic-tool", ["toolCallId"] = "call_browser", ["toolName"] = "browser_lookup",
+            ["state"] = approved ? "output-available" : "approval-responded", ["providerExecuted"] = false,
+            ["input"] = JsonNode.Parse(call.GetProperty("input").GetRawText()), ["output"] = "private",
+            ["approval"] = new JsonObject { ["id"] = approval.GetProperty("approvalId").GetString(),
+                ["signature"] = approval.GetProperty("signature").GetString(), ["approved"] = approved } };
+        request["messages"]!.AsArray().Add(new JsonObject { ["id"] = "a", ["role"] = "assistant", ["parts"] = new JsonArray(invocation) });
+        using var resumed = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, "alice-key"));
+        Assert.Contains("done", await resumed.Content.ReadAsStringAsync());
+        var forwarded = host.Gateway.Calls.Last().Body.GetProperty("input").EnumerateArray()
+            .Single(item => item.TryGetProperty("type", out var type) && type.ValueEquals("function_call_output"));
+        Assert.Equal(approved ? "private" : "The user declined to share this tool result.", forwarded.GetProperty("output").GetString());
+        invocation["input"]!["query"] = "tampered";
+        using var invalid = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, "alice-key"));
+        Assert.Equal(HttpStatusCode.BadRequest, invalid.StatusCode);
+        Assert.Equal(2, host.Gateway.Calls.Count);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Responses_preserves_native_approval_items(bool stream)
+    {
+        await using var host = await TestAgentHost.StartAsync(azure: true);
+        host.Gateway.Respond = call => GatewayFixture.Complete(call,
+            [new { type = "mcp_approval_request", id = "mcpr_real", server_label = "inventory", name = "lookup", arguments = "{}" }]);
+        using var response = await host.Client.SendAsync(TestAgentHost.Post(Responses, new { model = "GreetingAgent", input = "Find it", stream }, TestAgentHost.Token("alice")));
+        var wire = await response.Content.ReadAsStringAsync();
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains("mcpr_real", wire);
+        if (stream) Assert.Contains("response.output_item.done", wire);
+        var decision = new { model = "GreetingAgent", input = new object[]
+        {
+            new { role = "user", content = "Find it" },
+            new { type = "mcp_approval_response", approval_request_id = "mcpr_real", approve = false }
+        }};
+        host.Gateway.Respond = call => GatewayFixture.Text(call, "not executed");
+        using var wrongUser = await host.Client.SendAsync(TestAgentHost.Post(Responses, decision, TestAgentHost.Token("bob")));
+        Assert.Equal(HttpStatusCode.BadRequest, wrongUser.StatusCode);
+        using var resumed = await host.Client.SendAsync(TestAgentHost.Post(Responses, decision, TestAgentHost.Token("alice")));
+        Assert.Contains("not executed", await resumed.Content.ReadAsStringAsync());
+        Assert.Contains("mcp_approval_response", host.Gateway.Calls.Last().Body.GetRawText());
+        using var repeated = await host.Client.SendAsync(TestAgentHost.Post(Responses, decision, TestAgentHost.Token("alice")));
+        Assert.Equal(HttpStatusCode.BadRequest, repeated.StatusCode);
+        Assert.Equal(2, host.Gateway.Calls.Count);
+    }
 
     [Theory]
     [InlineData(false)]

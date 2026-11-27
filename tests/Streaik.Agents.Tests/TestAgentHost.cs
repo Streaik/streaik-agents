@@ -22,6 +22,7 @@ using Streaik.Agents.AspNetCore;
 using Streaik.Agents.AzureAuth;
 using Streaik.Agents.HeaderAuth;
 using Streaik.Agents.Json;
+using Streaik.Tools;
 
 namespace Streaik.Agents.Tests;
 
@@ -35,7 +36,7 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
     public HttpClient Client { get; } = client;
     public GatewayFixture Gateway { get; } = gateway;
 
-    public static async Task<TestAgentHost> StartAsync(bool azure = false, IAgentSource? extraSource = null)
+    public static async Task<TestAgentHost> StartAsync(bool azure = false, IAgentSource? extraSource = null, HostedToolAccess? mcp = null)
     {
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
@@ -52,6 +53,7 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
 
         var fixture = new GatewayFixture();
         builder.Services.AddStreaikAgents(builder.Configuration.GetSection("StreaikAgents"));
+        if (mcp is not null) builder.Services.AddSingleton(mcp);
         builder.Services.AddHttpClient(AgentHosting.GatewayClientName).ConfigurePrimaryHttpMessageHandler(() => fixture);
         if (azure)
         {
@@ -127,8 +129,8 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
 
     private sealed class TestAgentSource : IAgentSource
     {
-        public Task<IReadOnlyList<AgentDefinition>> GetAgentsAsync(CancellationToken cancellationToken)
-            => Task.FromResult<IReadOnlyList<AgentDefinition>>([
+        public Task<IReadOnlyList<Agent>> GetAgentsAsync(CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyList<Agent>>([
                 new() { Name = "GreetingAgent", Instructions = "Reply with a greeting.", Model = new() { Id = "openai/test" } },
                 new() { Name = "ReviewAgent", Model = new() { Id = "openai/review" } }
             ]);

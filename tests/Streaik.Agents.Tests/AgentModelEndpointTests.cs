@@ -18,16 +18,18 @@ public sealed class AgentModelEndpointTests
                 "providerMetadata":{"reasoning":{"effort":"low"},"opaque":[null,true,2]},
                 "providerHeaders":{"OpenAI-Beta":"sample","x-openai-key":"provider-secret"}},
                 {"id":"fireworks/routing","type":"decision"}],
-              "responseFormat":{"type":"json"},"mcpServers":{"search":{"url":"/mcp/search","headers":{"Authorization":"mcp-secret","X-Mode":"test"}}},
-              "mcpClient":{"policy":{"readOnlyHint":true}},"skills":[{"type":"skill_reference","skill_id":"research"}],
-              "tools":[{"type":"web_search"}],"icons":[{"src":"icon.png"}],"plugins":[{"type":"base64","data":"AQ=="}],
+              "responseFormat":{"type":"json"},"mcpClient":{"policy":{"readOnlyHint":true}},
+              "tools":[{"type":"web_search"},{"type":"skills","skills":[{"type":"skill_reference","skill_id":"openai/research"}]},
+                {"type":"mcp","server_label":"search","server_url":"https://search.example.test/mcp","authorization":"mcp-secret",
+                 "headers":{"X-Private":"mcp-secret"},"execution":"server"}],
+              "icons":[{"src":"icon.png"}],"plugins":[{"type":"base64","data":"AQ=="}],
               "evaluations":{"localEvaluator":{"nonEmpty":{"minLength":1}}},
               "transcription":{"id":"openai/transcribe"},"speech":{"model":{"id":"openai/speech"},"voice":"voice"},
               "futureAgentField":{"preserved":true}
             }
             """;
-        var agent = JsonSerializer.Deserialize<AgentDefinition>(definition, JsonSerializerOptions.Web)!;
-        await using var host = await TestAgentHost.StartAsync(extraSource: new FixedSource(agent, new AgentDefinition
+        var agent = JsonSerializer.Deserialize<Agent>(definition, JsonSerializerOptions.Web)!;
+        await using var host = await TestAgentHost.StartAsync(extraSource: new FixedSource(agent, new Agent
         {
             Name = "team/research/", Model = new AgentModel { Id = "openai/plain" }
         }));
@@ -51,7 +53,7 @@ public sealed class AgentModelEndpointTests
         Assert.Equal("research", Assert.Single(single.GetProperty("tags").EnumerateArray()).GetString());
         var published = single.GetProperty("agent");
         using var source = JsonDocument.Parse(definition);
-        foreach (var property in source.RootElement.EnumerateObject().Where(property => property.Name is not ("models" or "mcpServers" or "speech")))
+        foreach (var property in source.RootElement.EnumerateObject().Where(property => property.Name is not ("models" or "tools" or "speech")))
             Assert.True(JsonElement.DeepEquals(property.Value, published.GetProperty(property.Name)), property.Name);
         var model = published.GetProperty("models")[0];
         Assert.Equal("openai/first", model.GetProperty("id").GetString());
@@ -60,7 +62,8 @@ public sealed class AgentModelEndpointTests
         Assert.Equal("sample", model.GetProperty("providerHeaders").GetProperty("OpenAI-Beta").GetString());
         Assert.Equal("fireworks/routing", published.GetProperty("models")[1].GetProperty("id").GetString());
         Assert.Equal("openai/speech", published.GetProperty("speech").GetProperty("model").GetProperty("id").GetString());
-        Assert.Equal("test", published.GetProperty("mcpServers").GetProperty("search").GetProperty("headers").GetProperty("X-Mode").GetString());
+        Assert.Equal("server", published.GetProperty("tools")[2].GetProperty("execution").GetString());
+        Assert.Equal("openai/research", published.GetProperty("tools")[1].GetProperty("skills")[0].GetProperty("skill_id").GetString());
         Assert.DoesNotContain("provider-secret", single.GetRawText());
         Assert.DoesNotContain("mcp-secret", single.GetRawText());
         Assert.Equal("provider-secret", agent.Models![0]!.ProviderHeaders!["x-openai-key"]);
@@ -99,9 +102,9 @@ public sealed class AgentModelEndpointTests
         }
     }
 
-    private sealed class FixedSource(params AgentDefinition[] agents) : IAgentSource
+    private sealed class FixedSource(params Agent[] agents) : IAgentSource
     {
-        public Task<IReadOnlyList<AgentDefinition>> GetAgentsAsync(CancellationToken cancellationToken = default)
-            => Task.FromResult<IReadOnlyList<AgentDefinition>>(agents);
+        public Task<IReadOnlyList<Agent>> GetAgentsAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<Agent>>(agents);
     }
 }

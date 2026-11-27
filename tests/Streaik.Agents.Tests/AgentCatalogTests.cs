@@ -146,7 +146,7 @@ public sealed class AgentCatalogTests
 
     private sealed class FailingSource : IAgentSource
     {
-        public Task<IReadOnlyList<AgentDefinition>> GetAgentsAsync(CancellationToken cancellationToken)
+        public Task<IReadOnlyList<Agent>> GetAgentsAsync(CancellationToken cancellationToken)
             => throw new InvalidOperationException("private storage error");
     }
 
