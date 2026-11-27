@@ -29,7 +29,8 @@ public sealed class AgentEndpointTests
             CreateMcpHandler: _ => new InventoryMcp(() => calls++)));
         var request = JsonNode.Parse("""
             {"id":"mcp-review-chat","agent":{"name":"Inventory","model":{"id":"openai/test"},"tools":[
-              {"type":"mcp","execution":"provider","server_label":"inventory","server_url":"https://inventory.example.test/mcp"}]},
+              {"type":"mcp","execution":"provider","server_label":"inventory","server_url":"https://inventory.example.test/mcp",
+               "namespace":true,"disabled":true,"required":true,"require_approval":"always"}]},
              "messages":[{"id":"u","role":"user","parts":[{"type":"text","text":"look up"}]}]}
             """)!;
         host.Gateway.Respond = call => GatewayFixture.Complete(call,
@@ -39,7 +40,13 @@ public sealed class AgentEndpointTests
         var approval = Assert.Single(events, part => EventType(part) == "tool-approval-request");
         Assert.Equal(1, calls);
         Assert.Equal("inventory result", approval.GetProperty("approvalDescriptor").GetProperty("output").GetProperty("content")[0].GetProperty("text").GetString());
-        Assert.DoesNotContain("inventory result", host.Gateway.Calls.Single().Body.GetRawText());
+        var initialBody = host.Gateway.Calls.Single().Body;
+        Assert.DoesNotContain("inventory result", initialBody.GetRawText());
+        var mcp = Assert.Single(initialBody.GetProperty("tools").EnumerateArray(), tool => tool.GetProperty("type").ValueEquals("mcp"));
+        Assert.Equal("always", mcp.GetProperty("require_approval").GetString());
+        Assert.False(mcp.TryGetProperty("namespace", out _));
+        Assert.False(mcp.TryGetProperty("disabled", out _));
+        Assert.False(mcp.TryGetProperty("required", out _));
         var id = approval.GetProperty("approvalId").GetString();
         request["messages"]!.AsArray().Add(JsonNode.Parse($$$"""
             {"id":"a","role":"assistant","parts":[{"type":"dynamic-tool","toolName":"streaik_mcp_result_review","toolCallId":"{{{id}}}",

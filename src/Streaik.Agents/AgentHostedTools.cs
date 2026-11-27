@@ -25,6 +25,14 @@ internal sealed record AgentHostedTools(HostedToolDefinition[] Client, HostedToo
                 Dictionary<string, JsonElement> fields = new(StringComparer.Ordinal);
                 foreach (var field in tool.EnumerateObject())
                     if (!fields.TryAdd(field.Name, field.Value)) throw new JsonException("Duplicate hosted tool property.");
+                if (kind == "mcp")
+                {
+                    // These old switches no longer control execution. Namespace is browser presentation metadata.
+                    fields.Remove("disabled");
+                    fields.Remove("required");
+                    if (fields.Remove("namespace", out var grouping) && grouping.ValueKind is not (JsonValueKind.True or JsonValueKind.False or JsonValueKind.Null))
+                        throw new JsonException("namespace must be a boolean.");
+                }
                 var destination = client;
                 if (fields.Remove("execution", out var execution))
                 {
