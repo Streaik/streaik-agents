@@ -11,15 +11,11 @@ internal sealed class NativeResponseContent(ResponseInputItem item) : AIContent
     public ResponseInputItem Item { get; } = item;
 }
 
-internal sealed class McpReviewContent(McpResultReviews.Result review) : AIContent
-{
-    public McpResultReviews.Result Review { get; } = review;
-}
-
-internal sealed class AgentMcpApprovals(bool ui, string? nativeScope, string? reviewScope, ResponseToolDefinition[] tools,
-    McpApprovalDecisions decisions, McpResultReviews reviews, HostedToolAccess? access)
+internal sealed class AgentMcpApprovals(bool ui, string? nativeScope, string? reviewScope,
+    McpApprovalDecisions decisions, McpResultReviews reviews, ResponseToolDefinition[] tools, AgentExecutionApproval execution)
 {
     private readonly HashSet<string> replayed = new(StringComparer.Ordinal);
+    internal AgentExecutionApproval? Execution => ui ? execution : null;
 
     public void ValidateNative(IEnumerable<ResponseMcpApprovalResponseItem> items)
     {
@@ -30,7 +26,7 @@ internal sealed class AgentMcpApprovals(bool ui, string? nativeScope, string? re
             throw new AgentRequestException("Unknown, unauthorized, or already used MCP approval.", "mcp_approval_invalid");
     }
 
-    public async Task<List<AIContent>> ObserveAsync(ResponseResult response, CancellationToken ct)
+    public List<AIContent> Observe(string? model, ResponseResult response)
     {
         var approvals = response.OutputItems.OfType<ResponseMcpApprovalRequestItem>().ToArray();
         if (approvals.Length == 0) return [];
@@ -41,8 +37,6 @@ internal sealed class AgentMcpApprovals(bool ui, string? nativeScope, string? re
             if (nativeScope is not null) decisions.Observe(nativeScope, approvals.Select(item => item.Id!));
             return approvals.Select(item => (AIContent)new NativeResponseContent(item)).ToList();
         }
-        if (reviewScope is null || access is null)
-            throw new AgentRequestException("MCP review requires an authenticated caller, conversation ID, and authorized MCP access.", "mcp_review_not_authorized");
         var approvalIds = approvals.Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
         if (response.OutputItems.OfType<ResponseMcpCallItem>().Any(item => item.ApprovalRequestId is { } id && approvalIds.Contains(id)))
             throw new InvalidOperationException("The upstream returned a call together with its approval request.");
@@ -52,9 +46,12 @@ internal sealed class AgentMcpApprovals(bool ui, string? nativeScope, string? re
             if (approval.ServerLabel is not { Length: > 0 } server || approval.Name is not { Length: > 0 } name
                 || approval.Arguments is not { Length: > 0 and <= 65536 } args)
                 throw new InvalidOperationException("The upstream returned an invalid MCP approval request.");
-            var descriptor = Descriptor(server, name);
+            if (tools.Any(tool => tool.Extra?.GetValueOrDefault("server_label") is { ValueKind: JsonValueKind.String } label && label.ValueEquals(server)
+                && tool.Extra?.GetValueOrDefault("require_approval") is { ValueKind: JsonValueKind.String } policy && policy.ValueEquals("never")))
+                throw new AgentRequestException("The provider requested approval for an MCP server with approval disabled.", "mcp_approval_invalid");
             using var arguments = JsonDocument.Parse(args, new JsonDocumentOptions { AllowDuplicateProperties = false });
-            result.Add(new McpReviewContent(await reviews.ExecuteAsync(reviewScope, approval.Id!, descriptor, name, arguments.RootElement, access, ct, nativeScope)));
+            result.Add(execution.Issue(model, new("native", server, name, approval.Id!, args,
+                AgentExecutionApproval.Proof(response, AgentExecutionApproval.ProofsKey, approval.Id!)), arguments.RootElement.Clone()));
         }
         return result;
     }

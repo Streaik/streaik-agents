@@ -36,7 +36,8 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
     public HttpClient Client { get; } = client;
     public GatewayFixture Gateway { get; } = gateway;
 
-    public static async Task<TestAgentHost> StartAsync(bool azure = false, IAgentSource? extraSource = null, HostedToolAccess? mcp = null)
+    public static async Task<TestAgentHost> StartAsync(bool azure = false, IAgentSource? extraSource = null, HostedToolAccess? mcp = null,
+        string? signingSecret = "test-agent-tool-signing-key")
     {
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
@@ -44,6 +45,7 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
         builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["StreaikAgents:GatewayEndpoint"] = "https://gateway.example.test/base",
+            ["StreaikAgents:ToolApprovalSigningSecret"] = signingSecret,
             ["StreaikAgents:GatewayScopes:0"] = DownstreamScope,
             ["AzureAd:Instance"] = "https://login.microsoftonline.com/",
             ["AzureAd:TenantId"] = "00000000-0000-0000-0000-000000000002",

@@ -60,14 +60,20 @@ internal sealed record AgentInput(IReadOnlyList<Agent> Agents, AgentWorkflow Wor
             var scope = subject is null ? null : Hash(new { subject, agent = agents[0] });
             var reviewScope = scope is not null && chat?.Id is { Length: > 0 and <= 256 } id ? Hash(new { scope, id }) : null;
             var services = context.RequestServices;
-            mcp = new AgentMcpApprovals(ui, scope, reviewScope, nativeTools, services.GetRequiredService<McpApprovalDecisions>(),
-                services.GetRequiredService<McpResultReviews>(), services.GetService<HostedToolAccess>());
+            var chatScope = chat?.Id is { Length: > 0 and <= 256 } chatId ? Hash(new { subject, chatId, agent = agents[0] }) : null;
+            var signing = services.GetService<AgentToolApprovalSigning>();
+            if (signing is not null && context.User.Identity?.IsAuthenticated == true && subject is null)
+                throw new AgentRequestException("Tool approval signing is unavailable for this caller.");
+            mcp = new AgentMcpApprovals(ui, scope, reviewScope, services.GetRequiredService<McpApprovalDecisions>(),
+                services.GetRequiredService<McpResultReviews>(), nativeTools, new AgentExecutionApproval(chatScope,
+                    signing is null ? null : new Streaik.Vercel.Security.ToolApprovalSigner(signing.Secret, subject), AgentHostedTools.Read(agents[0])));
         }
 
         if (chat is not null)
         {
             var browser = new AgentBrowserTools(context, chat, agents);
-            return new AgentInput(agents, workflow, ValidateMessages(chat.Messages?.Select(message => MapUiMessage(message, browser, mcp))),
+            return new AgentInput(agents, workflow, ValidateMessages(chat.Messages?.Select(message => MapUiMessage(message, browser, mcp,
+                ReferenceEquals(message, chat.Messages.LastOrDefault())))),
                 Stream: true, Options: browser.Options, Browser: browser, Mcp: mcp);
         }
 
@@ -123,7 +129,7 @@ internal sealed record AgentInput(IReadOnlyList<Agent> Agents, AgentWorkflow Wor
         return history;
     }
 
-    private static ChatMessage MapUiMessage(UIMessage? message, AgentBrowserTools browser, AgentMcpApprovals? mcp)
+    private static ChatMessage MapUiMessage(UIMessage? message, AgentBrowserTools browser, AgentMcpApprovals? mcp, bool active)
     {
         if (message?.Parts is null)
             throw new AgentRequestException("A chat message must include 'parts'.");
@@ -138,6 +144,10 @@ internal sealed record AgentInput(IReadOnlyList<Agent> Agents, AgentWorkflow Wor
         foreach (var part in message.Parts)
         {
             if (part is TextUIPart { Text: { } text }) content.Add(new TextContent(text));
+            else if (part is ToolInvocationPart decision && AgentExecutionApproval.IsContinuation(decision) && mcp?.Execution is not null)
+            {
+                if (active || Streaik.Vercel.Security.HostedToolContinuation.IsResult(decision)) content.Add(new AgentExecutionApproval.Decision(decision, message.Role));
+            }
             else if (part is ToolInvocationPart review && AgentMcpApprovals.IsReview(review) && mcp is not null)
                 content.Add(mcp.Replay(message.Role, review));
             else if (part is ToolInvocationPart invocation) browser.Replay(message.Role, invocation, content);

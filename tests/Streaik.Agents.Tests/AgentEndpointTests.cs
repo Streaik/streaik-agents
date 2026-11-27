@@ -18,8 +18,10 @@ public sealed class AgentEndpointTests
     };
     private static readonly object ResponseBody = new { model = "GreetingAgent", input = "Say hi" };
 
-    [Fact]
-    public async Task ApiChat_converts_a_real_provider_approval_in_process_and_uses_the_client_result()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ApiChat_relays_provider_MCP_decisions_without_executing_them_locally(bool approved)
     {
         var endpoint = new Uri("https://inventory.example.test/mcp");
         var calls = 0;
@@ -38,8 +40,8 @@ public sealed class AgentEndpointTests
         using var first = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("alice")));
         var events = Events(await first.Content.ReadAsStringAsync(), out _);
         var approval = Assert.Single(events, part => EventType(part) == "tool-approval-request");
-        Assert.Equal(1, calls);
-        Assert.Equal("inventory result", approval.GetProperty("approvalDescriptor").GetProperty("output").GetProperty("content")[0].GetProperty("text").GetString());
+        Assert.Equal(0, calls);
+        Assert.False(approval.GetProperty("approvalDescriptor").TryGetProperty("output", out _));
         var initialBody = host.Gateway.Calls.Single().Body;
         Assert.DoesNotContain("inventory result", initialBody.GetRawText());
         var mcp = Assert.Single(initialBody.GetProperty("tools").EnumerateArray(), tool => tool.GetProperty("type").ValueEquals("mcp"));
@@ -47,20 +49,113 @@ public sealed class AgentEndpointTests
         Assert.False(mcp.TryGetProperty("namespace", out _));
         Assert.False(mcp.TryGetProperty("disabled", out _));
         Assert.False(mcp.TryGetProperty("required", out _));
-        var id = approval.GetProperty("approvalId").GetString();
-        request["messages"]!.AsArray().Add(JsonNode.Parse($$$"""
-            {"id":"a","role":"assistant","parts":[{"type":"dynamic-tool","toolName":"streaik_mcp_result_review","toolCallId":"{{{id}}}",
-              "providerExecuted":true,"state":"approval-responded","input":{},"output":"client-selected result","approval":{"id":"{{{id}}}","approved":true}}]}
-            """));
+        var decisionPart = HostedDecision(Assert.Single(events, part => EventType(part) == "tool-input-available"), approval, approved);
+        decisionPart["output"] = "client-selected result";
+        request["messages"]!.AsArray().Add(new JsonObject { ["id"] = "a", ["role"] = "assistant", ["parts"] = new JsonArray(decisionPart) });
         host.Gateway.Respond = call => GatewayFixture.Text(call, "done");
         using var wrongUser = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("bob")));
-        Assert.Equal(HttpStatusCode.BadRequest, wrongUser.StatusCode);
+        Assert.Contains("Unknown or invalid MCP execution approval", await wrongUser.Content.ReadAsStringAsync());
+        Assert.Single(host.Gateway.Calls);
         using var resumed = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("alice")));
         Assert.Contains("done", await resumed.Content.ReadAsStringAsync());
-        var input = host.Gateway.Calls.Last().Body.GetProperty("input").GetRawText();
-        Assert.Contains("client-selected result", input);
-        Assert.DoesNotContain("inventory result", input);
-        Assert.Equal(1, calls);
+        var input = host.Gateway.Calls.Last().Body.GetProperty("input");
+        var decision = Assert.Single(input.EnumerateArray(), item => item.GetProperty("type").ValueEquals("mcp_approval_response"));
+        Assert.Equal(approved, decision.GetProperty("approve").GetBoolean());
+        Assert.Equal("mcpr_native", decision.GetProperty("approval_request_id").GetString());
+        Assert.DoesNotContain("client-selected result", input.GetRawText());
+        Assert.Equal(0, calls);
+        request["messages"]!.AsArray().Add(JsonNode.Parse("""{"id":"u2","role":"user","parts":[{"type":"text","text":"Continue"}]}"""));
+        using var repeat = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("alice")));
+        Assert.DoesNotContain("mcp_approval_response", host.Gateway.Calls.Last().Body.GetProperty("input").GetRawText());
+    }
+
+    [Theory]
+    [InlineData(null, true, false)]
+    [InlineData(null, true, true)]
+    [InlineData("always", false, true)]
+    [InlineData("never", true, false)]
+    public async Task Agent_hosted_MCP_resumes_across_instances_and_obeys_execution_approval(string? policy, bool approved, bool signed)
+    {
+        var calls = 0;
+        var authorized = true;
+        Task<TestAgentHost> Start() => TestAgentHost.StartAsync(azure: true, mcp: new HostedToolAccess(
+            (_, _, _, _) => ValueTask.FromResult(authorized ? new McpEndpointAccess { AllowUnreviewedResults = true, ToolNames = new HashSet<string> { "lookup" } } : null),
+            CreateMcpHandler: _ => new InventoryMcp(() => calls++)), signingSecret: signed ? "local-test-agent-signing-key" : null);
+        await using var host = await Start();
+        await using var resumeHost = await Start();
+        var request = JsonNode.Parse("""
+            {"id":"agent-hosted-chat","agent":{"name":"Inventory","model":{"id":"openai/test"},"tools":[
+              {"type":"mcp","server_label":"inventory","server_url":"https://inventory.example.test/mcp","defer_loading":false}]},
+             "messages":[{"id":"u","role":"user","parts":[{"type":"text","text":"look up"}]}]}
+            """)!;
+        if (policy is not null) request["agent"]!["tools"]![0]!["require_approval"] = policy;
+        resumeHost.Gateway.Respond = host.Gateway.Respond = call =>
+        {
+            if (call.Body.ValueKind != JsonValueKind.Object) return GatewayFixture.Reply("""{"object":"list","data":[]}""");
+            if (call.Body.GetProperty("input").EnumerateArray().Any(item => item.TryGetProperty("type", out var type) && type.ValueEquals("function_call_output")))
+                return GatewayFixture.Text(call, "done");
+            var tool = Assert.Single(call.Body.GetProperty("tools").EnumerateArray(), item => item.GetProperty("name").GetString()!.StartsWith("mcp_lookup_", StringComparison.Ordinal));
+            return GatewayFixture.Complete(call, [new { type = "function_call", call_id = "call_inventory", name = tool.GetProperty("name").GetString(), arguments = "{}" }]);
+        };
+        using var first = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("alice")));
+        var wire = await first.Content.ReadAsStringAsync();
+        Assert.True(first.IsSuccessStatusCode, $"{wire}\n{string.Join('\n', host.Gateway.Calls.Select(call => call.Body.GetRawText()))}");
+        if (policy == "never")
+        {
+            Assert.DoesNotContain("tool-approval-request", wire);
+            Assert.Contains("done", wire);
+            Assert.Equal(1, calls);
+            return;
+        }
+        var events = Events(wire, out _);
+        var approval = Assert.Single(events, part => EventType(part) == "tool-approval-request");
+        Assert.Equal(signed, approval.TryGetProperty("signature", out var signature) && signature.ValueKind == JsonValueKind.String);
+        Assert.Equal(0, calls);
+        var decision = HostedDecision(Assert.Single(events, part => EventType(part) == "tool-input-available"), approval, approved);
+        request["messages"]!.AsArray().Add(new JsonObject { ["id"] = "a", ["role"] = "assistant", ["parts"] = new JsonArray(decision) });
+        if (signed)
+        {
+            decision["input"] = JsonNode.Parse("""{"changed":true}""");
+            using var changed = await resumeHost.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("alice")));
+            Assert.Contains("invalid MCP execution approval", await changed.Content.ReadAsStringAsync());
+            decision["input"] = new JsonObject();
+            decision["approval"]!.AsObject().Remove("signature");
+            using var unsigned = await resumeHost.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("alice")));
+            Assert.Contains("invalid MCP execution approval", await unsigned.Content.ReadAsStringAsync());
+            decision["approval"]!["signature"] = signature.GetString();
+        }
+        if (approved)
+        {
+            authorized = false;
+            using var denied = await resumeHost.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("alice")));
+            Assert.DoesNotContain("inventory result", await denied.Content.ReadAsStringAsync());
+            authorized = true;
+        }
+        Assert.Equal(0, calls);
+        using var resumed = await resumeHost.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("alice")));
+        var completed = await resumed.Content.ReadAsStringAsync();
+        Assert.Contains("done", completed);
+        Assert.Contains(approved ? "inventory result" : "declined to run", resumeHost.Gateway.Calls.Last().Body.GetProperty("input").GetRawText());
+        var frames = Events(completed, out _);
+        var receipt = JsonNode.Parse(Assert.Single(frames, part => EventType(part) == "tool-input-available").GetRawText())!;
+        receipt["type"] = "dynamic-tool";
+        receipt["state"] = "output-available";
+        receipt["output"] = JsonNode.Parse(Assert.Single(frames, part => EventType(part) == "tool-output-available").GetProperty("output").GetRawText());
+        decision.Parent!.AsArray().Add(receipt);
+        request["messages"]!.AsArray().Add(JsonNode.Parse("""{"id":"u2","role":"user","parts":[{"type":"text","text":"Continue"}]}"""));
+        using var next = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, TestAgentHost.Token("alice")));
+        Assert.Contains("done", await next.Content.ReadAsStringAsync());
+        Assert.Equal(approved ? 1 : 0, calls);
+    }
+
+    private static JsonObject HostedDecision(JsonElement call, JsonElement approval, bool approved)
+    {
+        var part = JsonNode.Parse(call.GetRawText())!.AsObject();
+        part["type"] = "dynamic-tool";
+        part["state"] = "approval-responded";
+        part["approval"] = new JsonObject { ["id"] = approval.GetProperty("approvalId").GetString(), ["approved"] = approved,
+            ["signature"] = approval.TryGetProperty("signature", out var signature) ? signature.GetString() : null };
+        return part;
     }
 
     private sealed class InventoryMcp(Action invoke) : HttpMessageHandler
@@ -114,7 +209,7 @@ public sealed class AgentEndpointTests
         Assert.Contains("done", await resumed.Content.ReadAsStringAsync());
         var forwarded = host.Gateway.Calls.Last().Body.GetProperty("input").EnumerateArray()
             .Single(item => item.TryGetProperty("type", out var type) && type.ValueEquals("function_call_output"));
-        Assert.Equal(approved ? "private" : "The user declined to share this tool result.", forwarded.GetProperty("output").GetString());
+        Assert.Equal(approved ? "private" : "The user declined to run this tool.", forwarded.GetProperty("output").GetString());
         invocation["input"]!["query"] = "tampered";
         using var invalid = await host.Client.SendAsync(TestAgentHost.Post(Chat, request, "alice-key"));
         Assert.Equal(HttpStatusCode.BadRequest, invalid.StatusCode);

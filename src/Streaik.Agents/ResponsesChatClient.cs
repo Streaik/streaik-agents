@@ -24,17 +24,19 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
     public async Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
         CancellationToken cancellationToken = default)
     {
-        var input = messages.SelectMany(MapMessage).ToList();
+        var continuation = await BuildInputAsync(messages, cancellationToken);
+        var input = continuation.Items;
         ResponseResult result;
         List<AIContent> review;
         UsageDetails? usage = null;
         for (var round = 0; ; round++)
         {
-            result = await gateway.GetResponses(CreateRequest(input, options, stream: false), providerId: null,
+            result = await gateway.GetResponses(CreateRequest(input, options, stream: false, continuation), providerId: null,
                 relativeUrl: Agent.DefaultTransport, headers: headers, ct: cancellationToken);
             CheckResult(result);
             AddUsage(result, ref usage);
-            review = await ReadApprovalsAsync(result, cancellationToken);
+            continuation.Complete(result, approvals?.Execution, model.Id);
+            review = ReadApprovals(result);
             if (review.Count > 0 || !await ContinueHostedAsync(result, input, round, options, cancellationToken)) break;
         }
         var calls = GetFunctionCalls(result, options).ToList();
@@ -54,8 +56,12 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
     public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages,
         ChatOptions? options = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var input = messages.SelectMany(MapMessage).ToList();
+        var continuation = await BuildInputAsync(messages, cancellationToken);
+        var input = continuation.Items;
         UsageDetails? usage = null;
+        foreach (var receipt in continuation.Receipts)
+            yield return new ChatResponseUpdate { Role = ChatRole.Assistant, Contents = [receipt] };
+        continuation.Receipts.Clear();
         var relay = reportHostedActivity && gatewayTools is { Length: > 0 } && options?.ToolMode is not NoneChatToolMode;
         var streamHeaders = headers;
         if (relay)
@@ -69,7 +75,7 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             var hasText = false;
             ResponseResult? result = null;
             HostedToolActivity? gatewayCall = null;
-            await foreach (var part in gateway.GetResponsesUpdates(CreateRequest(input, options, stream: true),
+            await foreach (var part in gateway.GetResponsesUpdates(CreateRequest(input, options, stream: true, continuation),
                 providerId: string.Empty, relativeUrl: Agent.DefaultTransport, headers: streamHeaders, ct: cancellationToken))
             {
                 if (part is ResponseOutputTextDelta { Delta.Length: > 0 } delta)
@@ -100,22 +106,32 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             CheckResult(result);
             AddUsage(result, ref usage);
             if (!hasText && GetText(result) is { Length: > 0 } text) yield return new ChatResponseUpdate(ChatRole.Assistant, text);
-            var review = await ReadApprovalsAsync(result, cancellationToken);
+            continuation.Complete(result, approvals?.Execution, model.Id);
+            foreach (var receipt in continuation.Receipts)
+                yield return new ChatResponseUpdate { Role = ChatRole.Assistant, Contents = [receipt] };
+            continuation.Receipts.Clear();
+            var review = ReadApprovals(result);
+            var pausedLocalCall = false;
             if (review.Count == 0 && HostedCall(result, round, options) is { } localCall)
             {
                 if (reportHostedActivity)
                 {
-                    await foreach (var activity in InvokeWithActivityAsync(result, localCall, input, cancellationToken))
-                        yield return ActivityUpdate(activity);
+                    await foreach (var content in InvokeWithActivityAsync(result, localCall, input, cancellationToken))
+                    {
+                        if (content is AgentExecutionApproval.Request) review.Add(content);
+                        else yield return new ChatResponseUpdate { Role = ChatRole.Assistant, Contents = [content] };
+                    }
                 }
-                else await InvokeHostedAsync(result, localCall, input, null, cancellationToken);
-                continue;
+                else if (await InvokeHostedAsync(result, localCall, input, null, cancellationToken) is { } pending) review.Add(pending);
+                if (review.Count == 0) continue;
+                pausedLocalCall = true;
             }
-            var calls = GetFunctionCalls(result, options).ToList();
+            // The paused call belongs to this host, not to the browser function dispatcher.
+            var calls = pausedLocalCall ? [] : GetFunctionCalls(result, options).ToList();
             var terminal = new ChatResponseUpdate
             {
                 Role = ChatRole.Assistant, ModelId = result.Model, ResponseId = result.Id,
-                FinishReason = calls.Count == 0 ? ChatFinishReason.Stop : ChatFinishReason.ToolCalls
+                FinishReason = calls.Count == 0 && review.Count == 0 ? ChatFinishReason.Stop : ChatFinishReason.ToolCalls
             };
             foreach (var call in calls) terminal.Contents.Add(call);
             foreach (var item in review) terminal.Contents.Add(item);
@@ -125,12 +141,12 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
         }
     }
 
-    private Task<List<AIContent>> ReadApprovalsAsync(ResponseResult result, CancellationToken ct)
+    private List<AIContent> ReadApprovals(ResponseResult result)
     {
-        if (!result.OutputItems.OfType<ResponseMcpApprovalRequestItem>().Any()) return Task.FromResult<List<AIContent>>([]);
+        if (!result.OutputItems.OfType<ResponseMcpApprovalRequestItem>().Any()) return [];
         if (hosted is not null && result.OutputItems.OfType<ResponseFunctionCallItem>().Any(call => hosted.Owns(call.Name)))
             throw new InvalidOperationException("The upstream mixed an approval with a backend tool call.");
-        return approvals?.ObserveAsync(result, ct) ?? throw new AgentRequestException(
+        return approvals?.Observe(model.Id, result) ?? throw new AgentRequestException(
             "The upstream requested MCP approval on a route that cannot continue it.", "mcp_approval_required");
     }
 
@@ -153,13 +169,15 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
         return calls[0];
     }
 
-    private async Task InvokeHostedAsync(ResponseResult result, ResponseFunctionCallItem call, List<ResponseInputItem> input,
+    private async Task<AgentExecutionApproval.Request?> InvokeHostedAsync(ResponseResult result, ResponseFunctionCallItem call, List<ResponseInputItem> input,
         Func<HostedToolActivity, Task>? observe, CancellationToken ct)
     {
         using var arguments = JsonDocument.Parse(call.Arguments);
         var outcome = observe is null
             ? await hosted!.InvokeAsync(call.Name, call.CallId, arguments.RootElement, ct)
             : await hosted!.InvokeAsync(call.Name, call.CallId, arguments.RootElement, observe, ct);
+        if (outcome is McpCallOutcome.ApprovalRequired { Approval: var approval } && approvals?.Execution is { } execution)
+            return execution.Issue(model.Id, new("local", approval.ServerLabel, approval.ToolName, approval.CallId), approval.Input);
         if (outcome is not McpCallOutcome.Completed completed)
             throw new AgentRequestException("This MCP call requires approval before execution and was not dispatched.", "mcp_approval_required");
         if (GetText(result) is { Length: > 0 } text)
@@ -168,20 +186,22 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
         input.Add(new ResponseFunctionCallOutputItem { CallId = call.CallId, Output = completed.Output.GetRawText() });
         if (input.RemoveAll(item => item is ResponseMcpApprovalResponseItem) > 0)
             input.AddRange(result.OutputItems.OfType<ResponseMcpCallItem>());
+        return null;
     }
 
-    private async IAsyncEnumerable<HostedToolActivity> InvokeWithActivityAsync(ResponseResult result, ResponseFunctionCallItem call,
+    private async IAsyncEnumerable<AIContent> InvokeWithActivityAsync(ResponseResult result, ResponseFunctionCallItem call,
         List<ResponseInputItem> input, [EnumeratorCancellation] CancellationToken ct)
     {
         // One invocation, at most two frames. Cancel and join it if enumeration stops early.
-        var queue = Channel.CreateUnbounded<HostedToolActivity>(new() { SingleReader = true, SingleWriter = true });
+        var queue = Channel.CreateUnbounded<AIContent>(new() { SingleReader = true, SingleWriter = true });
         using var invocation = CancellationTokenSource.CreateLinkedTokenSource(ct);
         async Task ExecuteAsync()
         {
             try
             {
-                await InvokeHostedAsync(result, call, input,
-                    activity => queue.Writer.WriteAsync(activity with { Input = activity.Input.Clone() }, invocation.Token).AsTask(), invocation.Token);
+                var pending = await InvokeHostedAsync(result, call, input,
+                    activity => queue.Writer.WriteAsync(new HostedToolActivityContent(activity with { Input = activity.Input.Clone() }), invocation.Token).AsTask(), invocation.Token);
+                if (pending is not null) await queue.Writer.WriteAsync(pending, invocation.Token);
                 queue.Writer.Complete();
             }
             catch (Exception error) { queue.Writer.TryComplete(error); }
@@ -218,7 +238,99 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
         (total ??= new UsageDetails()).Add(usage);
     }
 
-    private ResponseRequest CreateRequest(IEnumerable<ResponseInputItem> input, ChatOptions? options, bool stream)
+    private sealed class Continuation
+    {
+        public List<ResponseInputItem> Items { get; } = [];
+        public Dictionary<string, string> Proofs { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, string> History { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, (string Id, JsonElement Input, AgentExecutionApproval.Receipt Receipt)> Forwarded { get; } = new(StringComparer.Ordinal);
+        public List<AgentExecutionApproval.Request> Receipts { get; } = [];
+
+        public void Complete(ResponseResult response, AgentExecutionApproval? execution, string? model)
+        {
+            if (Forwarded.Count == 0) return;
+            Items.RemoveAll(item => item is ResponseMcpApprovalRequestItem or ResponseMcpApprovalResponseItem);
+            foreach (var item in response.OutputItems.OfType<ResponseMcpCallItem>())
+            {
+                if (item.ApprovalRequestId is not { } approvalId || !Forwarded.Remove(approvalId, out var result)) continue;
+                var proof = item.Id is { } id ? AgentExecutionApproval.Proof(response, AgentExecutionApproval.HistoryKey, id) : null;
+                var output = JsonSerializer.SerializeToElement(item, ResponseJson.Default);
+                if (execution is not null && output.GetRawText().Length <= 512 * 1024)
+                    Receipts.Add(execution.Complete(model, result.Id, result.Input, result.Receipt with { HistoryProof = proof }, output));
+                Items.Add(item);
+                if (item.Id is { } itemId && proof is not null) History[itemId] = proof;
+            }
+            Forwarded.Clear();
+            Proofs.Clear();
+        }
+    }
+
+    private async Task<Continuation> BuildInputAsync(IEnumerable<ChatMessage> messages, CancellationToken ct)
+    {
+        var continuation = new Continuation();
+        var history = messages.ToArray();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var completed = history.SelectMany(message => message.Contents.OfType<AgentExecutionApproval.Decision>())
+            .Where(decision => Streaik.Vercel.Security.HostedToolContinuation.IsResult(decision.Part)).Select(decision => decision.Part.ToolCallId).ToHashSet(StringComparer.Ordinal);
+        foreach (var message in history)
+        {
+            continuation.Items.AddRange(MapMessage(message));
+            foreach (var decision in message.Contents.OfType<AgentExecutionApproval.Decision>())
+            {
+                if (approvals?.Execution is not { } execution) throw new InvalidOperationException("Missing MCP continuation handler.");
+                var id = decision.Part.ToolCallId;
+                if (!seen.Add(id)) throw AgentExecutionApproval.Invalid();
+                if (Streaik.Vercel.Security.HostedToolContinuation.IsResult(decision.Part))
+                {
+                    var (receipt, input, output) = execution.ReadResult(model.Id, decision);
+                    if (receipt.Call.Kind == "native")
+                    {
+                        var item = output.Deserialize<ResponseMcpCallItem>(ResponseJson.Default);
+                        if (item?.ApprovalRequestId != receipt.Call.CallId || item.ServerLabel != receipt.Call.Server || item.Name != receipt.Call.Name)
+                            throw AgentExecutionApproval.Invalid();
+                        continuation.Items.Add(item);
+                        if (item.Id is { } nativeId && receipt.HistoryProof is { } proof) continuation.History[nativeId] = proof;
+                    }
+                    else AddLocal(continuation.Items, receipt.Call, input, receipt.Approved ? output : DeniedMcp);
+                    continue;
+                }
+                if (completed.Contains($"run_{id}")) continue;
+                var (pending, args, approved, descriptor) = execution.ReadDecision(model.Id, decision);
+                var completion = new AgentExecutionApproval.Receipt(pending, approved);
+                if (pending.Kind == "native")
+                {
+                    var arguments = pending.Arguments ?? "{}";
+                    if (arguments.Length > 65536 || !JsonElement.DeepEquals(args, JsonSerializer.Deserialize<JsonElement>(arguments))) throw AgentExecutionApproval.Invalid();
+                    if (!continuation.Forwarded.TryAdd(pending.CallId, (id, args, completion))) throw AgentExecutionApproval.Invalid();
+                    if (pending.Proof is { } token) continuation.Proofs.Add(pending.CallId, token);
+                    continuation.Items.Add(new ResponseMcpApprovalRequestItem { Id = pending.CallId, ServerLabel = pending.Server, Name = pending.Name, Arguments = arguments });
+                    continuation.Items.Add(new ResponseMcpApprovalResponseItem { ApprovalRequestId = pending.CallId, Approve = approved });
+                    continue;
+                }
+                var value = DeniedMcp;
+                if (approved)
+                {
+                    if (hosted is null || await hosted.ResumeApprovedAsync(new(id, pending.CallId, pending.Server,
+                        McpToolSession.EndpointBinding(descriptor.ServerUrl), pending.Name, ToolCaller.Direct, args), ct) is not McpCallOutcome.Completed done)
+                        throw AgentExecutionApproval.Invalid();
+                    value = done.Output;
+                    if (value.GetRawText().Length > 512 * 1024) throw new AgentRequestException("The MCP result is too large.", "mcp_approval_invalid");
+                }
+                AddLocal(continuation.Items, pending, args, value);
+                continuation.Receipts.Add(execution.Complete(model.Id, id, args, completion, value));
+            }
+        }
+        return continuation;
+    }
+
+    private static readonly JsonElement DeniedMcp = JsonSerializer.SerializeToElement("The user declined to run the MCP tool.");
+    private static void AddLocal(List<ResponseInputItem> items, AgentExecutionApproval.Call call, JsonElement input, JsonElement output)
+    {
+        items.Add(new ResponseFunctionCallItem { CallId = call.CallId, Name = HostedToolTurn.McpFunctionName("", call.Server, call.Name), Arguments = input.GetRawText() });
+        items.Add(new ResponseFunctionCallOutputItem { CallId = call.CallId, Output = output.ValueKind == JsonValueKind.String ? output.GetString()! : output.GetRawText() });
+    }
+
+    private ResponseRequest CreateRequest(IEnumerable<ResponseInputItem> input, ChatOptions? options, bool stream, Continuation continuation)
     {
         var enableTools = options?.ToolMode is not NoneChatToolMode;
         var functions = options?.Tools?.OfType<AIFunctionDeclaration>().Select(FunctionTool).ToList();
@@ -274,6 +386,10 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             Stream = stream,
             Store = false
         };
+        if (continuation.Proofs.Count != 0)
+            (request.AdditionalProperties ??= [])[AgentExecutionApproval.ProofsKey] = JsonSerializer.SerializeToElement(continuation.Proofs, ResponseJson.Default);
+        if (continuation.History.Count != 0)
+            (request.AdditionalProperties ??= [])[AgentExecutionApproval.HistoryKey] = JsonSerializer.SerializeToElement(continuation.History, ResponseJson.Default);
         if (model.ProviderMetadata is not { Count: > 0 } metadata) return request;
 
         // AIHappey stores native Responses options. Deserialize the merged object so known fields

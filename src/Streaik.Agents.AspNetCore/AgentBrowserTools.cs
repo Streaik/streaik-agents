@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.DependencyInjection;
 using Streaik.Tools;
 using Streaik.Vercel.Models;
 using Streaik.Vercel.Security;
@@ -10,7 +11,6 @@ namespace Streaik.Agents.AspNetCore;
 
 internal sealed class AgentBrowserTools
 {
-    private static readonly string Secret = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
     private static readonly JsonSerializerOptions Json = JsonSerializerOptions.Web;
     private readonly Dictionary<string, BrowserFunction> declarations = new(StringComparer.Ordinal);
     private readonly HashSet<string> seen = new(StringComparer.Ordinal);
@@ -24,11 +24,14 @@ internal sealed class AgentBrowserTools
         if (agents.Count != 1) throw new AgentRequestException("Browser tools are supported only in single-agent chat.");
         if (request.Id is not { Length: > 0 and <= 256 }) throw new AgentRequestException("Browser tools require a conversation ID.");
         if (request.Tools is { Length: > 128 }) throw new AgentRequestException("Too many browser tool declarations.");
-        var subject = McpResultReviews.Subject(context.User);
-        if (context.User.Identity?.IsAuthenticated == true && subject is null)
-            throw new AgentRequestException("Tool approval signing is unavailable for this caller.");
-        Signer = new ToolApprovalSigner(Secret, Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(
-            new { subject, request.Id, agent = agents[0] }, Json))));
+        if (context.RequestServices.GetService<AgentToolApprovalSigning>() is { } signing)
+        {
+            var subject = McpResultReviews.Subject(context.User);
+            if (context.User.Identity?.IsAuthenticated == true && subject is null)
+                throw new AgentRequestException("Tool approval signing is unavailable for this caller.");
+            Signer = new ToolApprovalSigner(signing.Secret, Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(
+                new { subject, request.Id, agent = agents[0] }, Json))));
+        }
         foreach (var tool in request.Tools ?? [])
         {
             if (tool?.Name is not { Length: > 0 and <= 64 } name || name.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '_' or '-'))
@@ -41,10 +44,10 @@ internal sealed class AgentBrowserTools
         }
         try
         {
-            Signer.ValidateIncoming((request.Messages ?? []).Where(message => message?.Parts is not null).Select(message => new UIMessage
+            Signer?.ValidateIncoming((request.Messages ?? []).Where(message => message?.Parts is not null).Select(message => new UIMessage
             {
                 Id = message.Id, Role = message.Role, Parts = message.Parts.Where(part => part is not ToolInvocationPart invocation
-                    || !AgentMcpApprovals.IsReview(invocation)).ToList()
+                    || !(AgentMcpApprovals.IsReview(invocation) || AgentExecutionApproval.IsContinuation(invocation))).ToList()
             }));
         }
         catch (ToolApprovalSignatureException error) { throw new AgentRequestException(error.Message); }
@@ -61,7 +64,7 @@ internal sealed class AgentBrowserTools
         if (!approved && tool.State is "approval-responded" or "output-denied")
         {
             parts.Add(new FunctionCallContent(id, name, arguments));
-            parts.Add(new FunctionResultContent(id, "The user declined to share this tool result."));
+            parts.Add(new FunctionResultContent(id, "The user declined to run this tool."));
         }
         else if (approved && tool.State is "output-available" or "output-error" or "approval-responded"
             && (tool.Output is not null || tool.ErrorText is not null))
@@ -69,6 +72,6 @@ internal sealed class AgentBrowserTools
             parts.Add(new FunctionCallContent(id, name, arguments));
             parts.Add(new FunctionResultContent(id, tool.ErrorText ?? tool.Output));
         }
-        else throw new AgentRequestException("Browser tools require a completed, reviewed result before continuing.");
+        else throw new AgentRequestException("Browser tools require execution approval and a result before continuing.");
     }
 }

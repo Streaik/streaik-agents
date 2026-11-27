@@ -22,6 +22,8 @@ public static class AgentHosting
         services.AddSingleton<AgentCatalog>();
         services.TryAddSingleton(new McpResultReviews());
         services.TryAddSingleton(new McpApprovalDecisions());
+        if (configuration["ToolApprovalSigningSecret"] is { } secret && !string.IsNullOrWhiteSpace(secret))
+            services.TryAddSingleton(new AgentToolApprovalSigning(secret));
         services.AddHttpClient(GatewayClientName, client => client.BaseAddress = baseAddress)
             .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false, UseCookies = false });
         services.AddScoped(services => new AgentRuntime(services.GetRequiredService<IHttpClientFactory>().CreateClient(GatewayClientName),
@@ -29,6 +31,8 @@ public static class AgentHosting
         return services;
     }
 }
+
+internal sealed record AgentToolApprovalSigning(string Secret);
 
 /// <summary>Supplies credentials for one agent run to the host-configured gateway only.</summary>
 public interface IAgentGatewayHeaders

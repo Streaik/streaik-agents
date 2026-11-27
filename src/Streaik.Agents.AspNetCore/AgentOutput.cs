@@ -80,7 +80,7 @@ internal sealed class AgentOutput(HttpResponse response, string name, bool ui, C
                 var id = Guid.NewGuid().ToString("N");
                 await EventAsync(call);
                 await EventAsync(new ToolApprovalRequestUIPart { ToolCallId = call.ToolCallId, ApprovalId = id,
-                    Signature = signer!.CreateSignature(id, call) });
+                    Signature = signer?.CreateSignature(id, call) });
             }
             if (!ui && part is NativeResponseContent native)
             {
@@ -89,17 +89,13 @@ internal sealed class AgentOutput(HttpResponse response, string name, bool ui, C
                 await EventAsync(new ResponseOutputItemDone { Item = item, OutputIndex = _nativeItems.Count - 1 + (_text.Length > 0 ? 1 : 0),
                     SequenceNumber = _sequence++ });
             }
-            if (ui && part is McpReviewContent reviewed)
+            if (ui && part is AgentExecutionApproval.Request pending)
             {
-                _review = true;
-                var review = reviewed.Review;
-                var call = new ToolCallPart { ToolCallId = review.Id, ToolName = McpResultReviews.ToolName,
-                    Title = $"Review MCP result: {review.Name}", ProviderExecuted = true, Dynamic = true,
-                    Input = review.Input, ToolMetadata = new() { ["mcpReviewOutput"] = review.Output!.Value } };
-                await EventAsync(call);
-                await EventAsync(new ToolApprovalRequestUIPart { ToolCallId = review.Id, ApprovalId = review.Id,
-                    Reason = "Review the completed MCP result before sending it to the model.",
-                    ApprovalDescriptor = new { server = review.Server, name = review.Name, input = review.Input, output = review.Output } });
+                foreach (var frame in pending.Parts)
+                {
+                    if (frame is ToolApprovalRequestUIPart) _review = true;
+                    await EventAsync<UIMessagePart>(frame);
+                }
             }
             if (part is not TextContent { Text.Length: > 0 } text) continue;
             if (_text.Length == 0) await StartTextAsync();
