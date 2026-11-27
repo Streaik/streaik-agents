@@ -5,10 +5,10 @@ namespace Streaik.Agents.HeaderAuth;
 
 internal sealed class HeaderGatewayHeaders : IAgentGatewayHeaders
 {
-    public ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, AgentDefinition agent, CancellationToken cancellationToken)
+    public ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, Agent agent, CancellationToken cancellationToken)
         => GetHeadersAsync(context, agent, singleProvider: true, cancellationToken);
 
-    public ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, AgentDefinition agent,
+    public ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, Agent agent,
         bool singleProvider, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();

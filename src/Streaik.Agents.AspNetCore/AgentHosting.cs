@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Streaik.Tools;
 
 namespace Streaik.Agents.AspNetCore;
 
@@ -18,9 +20,12 @@ public static class AgentHosting
 
         var baseAddress = new Uri(gateway.AbsoluteUri.TrimEnd('/') + "/");
         services.AddSingleton<AgentCatalog>();
+        services.TryAddSingleton(new McpResultReviews());
+        services.TryAddSingleton(new McpApprovalDecisions());
         services.AddHttpClient(GatewayClientName, client => client.BaseAddress = baseAddress)
             .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false, UseCookies = false });
-        services.AddScoped(services => new AgentRuntime(services.GetRequiredService<IHttpClientFactory>().CreateClient(GatewayClientName)));
+        services.AddScoped(services => new AgentRuntime(services.GetRequiredService<IHttpClientFactory>().CreateClient(GatewayClientName),
+            services.GetService<HostedToolAccess>()));
         return services;
     }
 }
@@ -28,10 +33,10 @@ public static class AgentHosting
 /// <summary>Supplies credentials for one agent run to the host-configured gateway only.</summary>
 public interface IAgentGatewayHeaders
 {
-    ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, AgentDefinition agent, CancellationToken cancellationToken);
+    ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, Agent agent, CancellationToken cancellationToken);
 
     /// <summary>Indicates whether an unscoped provider API key is unambiguous for this request.</summary>
-    ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, AgentDefinition agent,
+    ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, Agent agent,
         bool singleProvider, CancellationToken cancellationToken) => GetHeadersAsync(context, agent, cancellationToken);
 }
 

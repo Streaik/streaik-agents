@@ -1,16 +1,21 @@
+using System.Security.Cryptography;
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.AI;
 using Streaik.Responses;
+using Streaik.Tools;
 using Streaik.Vercel.Models;
 
 namespace Streaik.Agents.AspNetCore;
 
-internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWorkflow Workflow,
-    IReadOnlyList<ChatMessage> Messages, bool Stream, ChatOptions? Options = null)
+internal sealed record AgentInput(IReadOnlyList<Agent> Agents, AgentWorkflow Workflow,
+    IReadOnlyList<ChatMessage> Messages, bool Stream, ChatOptions? Options = null, AgentBrowserTools? Browser = null,
+    AgentMcpApprovals? Mcp = null)
 {
     private static readonly JsonSerializerOptions WebJson = new(JsonSerializerDefaults.Web);
 
-    public static async Task<AgentInput> ParseAsync(JsonElement body, AgentCatalog catalog, bool ui, CancellationToken cancellationToken)
+    public static async Task<AgentInput> ParseAsync(JsonElement body, AgentCatalog catalog, bool ui, HttpContext context, CancellationToken cancellationToken)
     {
         if (body.ValueKind != JsonValueKind.Object)
             throw new AgentRequestException("The request body must be a JSON object.");
@@ -27,14 +32,14 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
         if (body.TryGetProperty("background", out var background) && background.ValueKind is not (JsonValueKind.False or JsonValueKind.Null)
             || body.TryGetProperty("store", out var store) && store.ValueKind is not (JsonValueKind.False or JsonValueKind.Null))
             throw new AgentRequestException("Only foreground, stateless runs are supported.");
-        if (body.TryGetProperty("tools", out var tools) && tools.ValueKind != JsonValueKind.Null
+        if (!ui && body.TryGetProperty("tools", out var tools) && tools.ValueKind != JsonValueKind.Null
             && !(tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() == 0))
             throw new AgentRequestException("Tools are not supported in v1.");
 
         var chat = ui ? body.Deserialize<AgentChatRequest>(WebJson) : null;
         var responses = ui ? null : body.Deserialize<AgentResponsesRequest>(WebJson);
         AgentSelection selection = chat is not null ? chat : responses!;
-        var agents = new List<AgentDefinition>();
+        var agents = new List<Agent>();
         if (selection.Agent is { } inline) agents.Add(ValidateInline(inline));
         foreach (var agent in selection.Agents ?? [])
             agents.Add(ValidateInline(agent ?? throw new AgentRequestException("'agents' must contain agent definitions.")));
@@ -45,26 +50,53 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
             throw new AgentRequestException("Select at least one agent using 'model', 'models', 'agent', or 'agents'.");
         var workflow = AgentWorkflow.Validate(chat?.WorkflowType ?? responses?.WorkflowType,
             chat?.WorkflowMetadata ?? responses?.WorkflowMetadata, agents, typeField, metadataField);
+        var nativeTools = agents.SelectMany(agent => AgentHostedTools.Read(agent).NativeMcp).ToArray();
+        if (agents.Count != 1 && nativeTools.Length != 0)
+            throw new AgentRequestException("Provider MCP approval is supported only in single-agent runs.");
+        AgentMcpApprovals? mcp = null;
+        if (agents.Count == 1)
+        {
+            var subject = McpResultReviews.Subject(context.User);
+            var scope = subject is null ? null : Hash(new { subject, agent = agents[0] });
+            var reviewScope = scope is not null && chat?.Id is { Length: > 0 and <= 256 } id ? Hash(new { scope, id }) : null;
+            var services = context.RequestServices;
+            mcp = new AgentMcpApprovals(ui, scope, reviewScope, nativeTools, services.GetRequiredService<McpApprovalDecisions>(),
+                services.GetRequiredService<McpResultReviews>(), services.GetService<HostedToolAccess>());
+        }
 
         if (chat is not null)
-            return new AgentInput(agents, workflow, ValidateMessages(chat.Messages?.Select(MapUiMessage)), Stream: true);
+        {
+            var browser = new AgentBrowserTools(context, chat, agents);
+            return new AgentInput(agents, workflow, ValidateMessages(chat.Messages?.Select(message => MapUiMessage(message, browser, mcp))),
+                Stream: true, Options: browser.Options, Browser: browser, Mcp: mcp);
+        }
 
         var request = responses!;
         // Run instructions supplement, rather than replace, the selected agent's instructions.
         var history = MapResponseInput(request.Input);
+        var replies = history.SelectMany(message => message.Contents.OfType<NativeResponseContent>())
+            .Select(content => content.Item).OfType<ResponseMcpApprovalResponseItem>().ToArray();
         if (!string.IsNullOrWhiteSpace(request.Instructions))
             history.Insert(0, new ChatMessage(ChatRole.System, request.Instructions));
         if (request.MaxOutputTokens is <= 0)
             throw new AgentRequestException("'max_output_tokens' must be positive.");
-        return new AgentInput(agents, workflow, ValidateMessages(history), request.Stream == true, new ChatOptions
+        var validated = ValidateMessages(history);
+        if (replies.Length > 0)
+        {
+            if (mcp is null) throw new AgentRequestException("MCP approval continuation is only supported in single-agent runs.");
+            mcp.ValidateNative(replies);
+        }
+        return new AgentInput(agents, workflow, validated, request.Stream == true, new ChatOptions
         {
             MaxOutputTokens = request.MaxOutputTokens,
             Temperature = (float?)request.Temperature,
             TopP = (float?)request.TopP
-        });
+        }, Mcp: mcp);
     }
 
-    private static AgentDefinition ValidateInline(AgentDefinition agent)
+    private static string Hash<T>(T value) => Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(value, WebJson)));
+
+    private static Agent ValidateInline(Agent agent)
     {
         AgentRuntime.Validate(agent);
         return agent;
@@ -91,7 +123,7 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
         return history;
     }
 
-    private static ChatMessage MapUiMessage(UIMessage? message)
+    private static ChatMessage MapUiMessage(UIMessage? message, AgentBrowserTools browser, AgentMcpApprovals? mcp)
     {
         if (message?.Parts is null)
             throw new AgentRequestException("A chat message must include 'parts'.");
@@ -106,6 +138,9 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
         foreach (var part in message.Parts)
         {
             if (part is TextUIPart { Text: { } text }) content.Add(new TextContent(text));
+            else if (part is ToolInvocationPart review && AgentMcpApprovals.IsReview(review) && mcp is not null)
+                content.Add(mcp.Replay(message.Role, review));
+            else if (part is ToolInvocationPart invocation) browser.Replay(message.Role, invocation, content);
             else if (part?.Type is not ("step-start" or "reasoning"))
                 throw new AgentRequestException("Only text chat message parts are supported.");
         }
@@ -120,6 +155,11 @@ internal sealed record AgentInput(IReadOnlyList<AgentDefinition> Agents, AgentWo
         var messages = new List<ChatMessage>();
         foreach (var item in items)
         {
+            if (item is ResponseMcpApprovalResponseItem decision)
+            {
+                messages.Add(new ChatMessage(ChatRole.User, [new NativeResponseContent(decision)]));
+                continue;
+            }
             if (item is not ResponseInputMessage { Content: { } content } message)
                 throw new AgentRequestException("Only text message input items are supported.");
             var role = message.Role switch

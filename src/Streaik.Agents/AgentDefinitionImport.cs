@@ -4,9 +4,9 @@ namespace Streaik.Agents;
 
 internal static class AgentDefinitionImport
 {
-    public static AgentDefinition? Read(Stream json, DateTimeOffset? lastModified = null)
+    public static Agent? Read(Stream json, DateTimeOffset? lastModified = null)
     {
-        var agent = JsonSerializer.Deserialize<AgentDefinition>(json, JsonSerializerOptions.Web);
+        var agent = JsonSerializer.Deserialize<Agent>(json, JsonSerializerOptions.Web);
         if (agent is null || string.IsNullOrWhiteSpace(agent.Name)) return null;
         agent.Created = lastModified?.ToUnixTimeSeconds();
         return agent;

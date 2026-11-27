@@ -7,10 +7,10 @@ internal sealed record AgentWorkflow(string Type, WorkflowMetadata? Metadata, st
 {
     internal static readonly string[] SupportedTypes = ["sequential", "concurrent", "handoff", "groupchat", "magentic", "decisions"];
 
-    public AgentDefinition? Router => Metadata?.Decisions is { } decision && Type == "decisions"
+    public Agent? Router => Metadata?.Decisions is { } decision && Type == "decisions"
         ? new() { Name = "Decisions router", Model = new AgentModel { Id = decision.Model } } : null;
 
-    public static AgentWorkflow Validate(string? type, WorkflowMetadata? metadata, IReadOnlyList<AgentDefinition> agents,
+    public static AgentWorkflow Validate(string? type, WorkflowMetadata? metadata, IReadOnlyList<Agent> agents,
         string typeField, string metadataField)
     {
         type ??= "sequential";
@@ -45,7 +45,7 @@ internal sealed record AgentWorkflow(string Type, WorkflowMetadata? Metadata, st
         return workflow;
     }
 
-    public IReadOnlyList<(int From, int To)> GetHandoffs(IReadOnlyList<AgentDefinition> agents)
+    public IReadOnlyList<(int From, int To)> GetHandoffs(IReadOnlyList<Agent> agents)
     {
         if (Metadata?.Handoff?.Handoffs is not { Count: > 0 } pairs)
             throw new AgentRequestException($"Provide at least one pair in '{MetadataField}.handoff.handoffs'.");

@@ -39,7 +39,7 @@ public static class AgentEndpoints
                 await ErrorAsync(context, 415, "invalid_request", "Send the request as JSON.");
                 return;
             }
-            input = await AgentInput.ParseAsync(await context.Request.ReadFromJsonAsync<JsonElement>(ct), catalog, ui, ct);
+            input = await AgentInput.ParseAsync(await context.Request.ReadFromJsonAsync<JsonElement>(ct), catalog, ui, context, ct);
         }
         catch (AgentRequestException error)
         {
@@ -67,9 +67,9 @@ public static class AgentEndpoints
             var providers = (router is null ? participants : participants.Append(router)).SelectMany(AgentRuntime.PotentialProviders)
                 .Concat(participants.SelectMany(AgentRuntime.SkillProviders));
             var singleProvider = providers.Distinct(StringComparer.Ordinal).Take(2).Count() == 1;
-            var headerCache = new Dictionary<(AgentDefinition, AgentModel), IReadOnlyDictionary<string, string>>();
+            var headerCache = new Dictionary<(Agent, AgentModel), IReadOnlyDictionary<string, string>>();
 
-            async ValueTask<IReadOnlyDictionary<string, string>?> HeadersFor(AgentDefinition agent, AgentModel model, bool optional)
+            async ValueTask<IReadOnlyDictionary<string, string>?> HeadersFor(Agent agent, AgentModel model, bool optional)
             {
                 if (credentials is null) return AgentRuntime.EmptyHeaders;
                 var key = (agent, model);
@@ -90,16 +90,17 @@ public static class AgentEndpoints
             var targets = await runtime.ResolveTargetsAsync(participants, input.Messages, HeadersFor, ct);
 
             var primary = targets[0];
-            output = new AgentOutput(context.Response, participants.Count == 1 ? primary.Definition.Name! : input.Workflow.Type, ui, ct);
+            output = new AgentOutput(context.Response, participants.Count == 1 ? primary.Definition.Name! : input.Workflow.Type, ui, ct, input.Browser?.Signer);
             if (!input.Stream && participants.Count == 1)
             {
-                var result = await runtime.RunResolvedAsync(primary, input.Messages, input.Options, ct);
-                await context.Response.WriteAsJsonAsync(output.Snapshot("completed", result.Text, result.Usage), ResponseJson.Default, ct);
+                var result = await runtime.RunResolvedAsync(primary, input.Messages, input.Options, ct, input.Mcp);
+                var items = result.Messages.SelectMany(message => message.Contents.OfType<NativeResponseContent>()).Select(content => content.Item);
+                await context.Response.WriteAsJsonAsync(output.Snapshot("completed", result.Text, result.Usage, nativeItems: items), ResponseJson.Default, ct);
                 return;
             }
 
             var updates = participants.Count == 1
-                ? runtime.StreamResolvedAsync(primary, input.Messages, input.Options, ct)
+                ? runtime.StreamResolvedAsync(primary, input.Messages, input.Options, ct, input.Mcp)
                 : runtime.RunWorkflowAsync(input.Workflow, targets, input.Messages.ToList(), input.Options, input.Stream, ct);
             if (!input.Stream)
             {

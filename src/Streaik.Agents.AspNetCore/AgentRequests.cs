@@ -11,8 +11,8 @@ internal abstract class AgentSelection
 {
     public string? Model { get; init; }
     public IReadOnlyList<string?>? Models { get; init; }
-    public AgentDefinition? Agent { get; init; }
-    public IReadOnlyList<AgentDefinition?>? Agents { get; init; }
+    public Agent? Agent { get; init; }
+    public IReadOnlyList<Agent?>? Agents { get; init; }
 }
 
 internal sealed class AgentChatRequest : AgentSelection
@@ -24,6 +24,8 @@ internal sealed class AgentChatRequest : AgentSelection
     public string? WorkflowType { get; init; }
     [JsonPropertyName(WorkflowMetadataField)]
     public WorkflowMetadata? WorkflowMetadata { get; init; }
+    public string? Id { get; init; }
+    public Tool[]? Tools { get; init; }
     public required UIMessage[] Messages { get; init; }
 }
 

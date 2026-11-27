@@ -2,18 +2,18 @@ namespace Streaik.Agents.Json;
 
 public sealed class JsonAgentSource : IAgentSource
 {
-    private readonly IReadOnlyList<AgentDefinition> _agents = LoadBundledAgents();
+    private readonly IReadOnlyList<Agent> _agents = LoadBundledAgents();
 
-    public Task<IReadOnlyList<AgentDefinition>> GetAgentsAsync(CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<Agent>> GetAgentsAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(_agents);
     }
 
-    private static IReadOnlyList<AgentDefinition> LoadBundledAgents()
+    private static IReadOnlyList<Agent> LoadBundledAgents()
     {
         var assembly = typeof(JsonAgentSource).Assembly;
-        var agents = new List<AgentDefinition>();
+        var agents = new List<Agent>();
         foreach (var resource in assembly.GetManifestResourceNames().Where(name =>
                      name.StartsWith("Streaik.Agents.Json.Agents.", StringComparison.Ordinal) &&
                      name.EndsWith(".Agent.json", StringComparison.Ordinal)).Order(StringComparer.Ordinal))

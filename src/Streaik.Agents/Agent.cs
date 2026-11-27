@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 
 namespace Streaik.Agents;
 
-public sealed class AgentDefinition
+public sealed class Agent
 {
     internal const string DefaultTransport = "v1/responses";
     private AgentModel? _model;
@@ -41,17 +41,9 @@ public sealed class AgentDefinition
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? ResponseFormat { get; init; }
 
-    [JsonPropertyName("mcpServers")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public Dictionary<string, JsonElement>? McpServers { get; init; }
-
     [JsonPropertyName("mcpClient")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? McpClient { get; init; }
-
-    [JsonPropertyName("skills")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public IReadOnlyList<JsonElement>? Skills { get; init; }
 
     [JsonPropertyName("tools")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -87,11 +79,14 @@ public sealed class AgentDefinition
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? AdditionalProperties { get; init; }
 
+    internal static bool IsRemovedField(string name) => name.Equals("mcpServers", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("skills", StringComparison.OrdinalIgnoreCase);
+
     // Preserve the logical agent for existing host credential resolvers, but identify the current provider.
-    internal AgentDefinition ForModel(AgentModel model)
+    internal Agent ForModel(AgentModel model)
     {
         if (ReferenceEquals(Model, model)) return this;
-        var target = (AgentDefinition)MemberwiseClone();
+        var target = (Agent)MemberwiseClone();
         target._model = model;
         return target;
     }

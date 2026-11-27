@@ -2,14 +2,14 @@ namespace Streaik.Agents;
 
 public interface IAgentSource
 {
-    Task<IReadOnlyList<AgentDefinition>> GetAgentsAsync(CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<Agent>> GetAgentsAsync(CancellationToken cancellationToken = default);
 }
 
 public sealed class AgentCatalog(IEnumerable<IAgentSource> sources)
 {
     private readonly IAgentSource[] _sources = sources.ToArray();
 
-    public async Task<IReadOnlyList<AgentDefinition>> ResolveAsync(IReadOnlyList<string?> names,
+    public async Task<IReadOnlyList<Agent>> ResolveAsync(IReadOnlyList<string?> names,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -18,7 +18,7 @@ public sealed class AgentCatalog(IEnumerable<IAgentSource> sources)
             throw new AgentRequestException("'model' and 'models' must contain nonempty agent names.");
 
         var merged = await GetMergedAsync(cancellationToken);
-        var resolved = new List<AgentDefinition>(names.Count);
+        var resolved = new List<Agent>(names.Count);
         foreach (var name in names)
         {
             if (!merged.TryGetValue(name!, out var agent))
@@ -29,19 +29,19 @@ public sealed class AgentCatalog(IEnumerable<IAgentSource> sources)
         return resolved;
     }
 
-    public async Task<IReadOnlyList<AgentDefinition>> ListAsync(CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<Agent>> ListAsync(CancellationToken cancellationToken = default)
         => (await GetMergedAsync(cancellationToken)).Values.OrderBy(agent => agent.Name, StringComparer.OrdinalIgnoreCase).ToArray();
 
-    public async Task<AgentDefinition?> FindAsync(string name, CancellationToken cancellationToken = default)
+    public async Task<Agent?> FindAsync(string name, CancellationToken cancellationToken = default)
         => string.IsNullOrWhiteSpace(name) ? null : (await GetMergedAsync(cancellationToken)).GetValueOrDefault(name);
 
-    private async Task<Dictionary<string, AgentDefinition>> GetMergedAsync(CancellationToken cancellationToken)
+    private async Task<Dictionary<string, Agent>> GetMergedAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var merged = new Dictionary<string, AgentDefinition>(StringComparer.OrdinalIgnoreCase);
+        var merged = new Dictionary<string, Agent>(StringComparer.OrdinalIgnoreCase);
         foreach (var source in _sources)
         {
-            IReadOnlyList<AgentDefinition> agents;
+            IReadOnlyList<Agent> agents;
             try
             {
                 agents = await source.GetAgentsAsync(cancellationToken);

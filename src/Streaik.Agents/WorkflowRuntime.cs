@@ -4,13 +4,14 @@ using System.Text.Json;
 using Microsoft.Agents.AI;
 using Microsoft.Agents.AI.Workflows;
 using Microsoft.Extensions.AI;
+using Streaik.Tools;
 using Streaik.Vercel.Models;
 
 namespace Streaik.Agents;
 
 public sealed partial class AgentRuntime
 {
-    internal async Task<AgentDefinition> SelectAgentAsync(AgentDefinition router, IReadOnlyList<AgentDefinition> candidates,
+    internal async Task<Agent> SelectAgentAsync(Agent router, IReadOnlyList<Agent> candidates,
         IReadOnlyList<ChatMessage> messages, IReadOnlyDictionary<string, string>? headers, CancellationToken ct)
     {
         var choices = candidates.Select((agent, i) => (Id: $"agent-{i}", Agent: agent))
@@ -57,7 +58,14 @@ public sealed partial class AgentRuntime
     {
         var usage = new UsageDetails();
         var hasUsage = false;
-        var agents = targets.Select(target => (AIAgent)CreateAgent(target, options, ObserveUsage)).ToArray();
+        await using var turns = new WorkflowToolTurns();
+        var agents = new List<AIAgent>(targets.Count);
+        foreach (var target in targets)
+        {
+            var turn = await OpenToolsAsync(target, ct);
+            if (turn is not null) turns.Items.Add(turn);
+            agents.Add(CreateAgent(target, turn, options, ObserveUsage));
+        }
         var graph = BuildWorkflow(workflow, targets.Select(target => target.Definition).ToArray(), agents);
         // Our endpoints expose one text item. Use the aggregated output for concurrent branches
         // to avoid interleaving their tokens, and the final answer for Magentic to keep planning private.
@@ -111,6 +119,20 @@ public sealed partial class AgentRuntime
         }
     }
 
+    private sealed class WorkflowToolTurns : IAsyncDisposable
+    {
+        public List<HostedToolTurn> Items { get; } = [];
+
+        public async ValueTask DisposeAsync()
+        {
+            List<Exception>? failures = null;
+            foreach (var turn in Items)
+                try { await turn.DisposeAsync(); }
+                catch (Exception error) { (failures ??= []).Add(error); }
+            if (failures is not null) throw new AggregateException(failures);
+        }
+    }
+
     private static string? OutputText(object? data, List<ChatMessage> input) => data switch
     {
         string text => text,
@@ -122,7 +144,7 @@ public sealed partial class AgentRuntime
         _ => null
     };
 
-    private static Workflow BuildWorkflow(AgentWorkflow workflow, IReadOnlyList<AgentDefinition> definitions, IReadOnlyList<AIAgent> agents)
+    private static Workflow BuildWorkflow(AgentWorkflow workflow, IReadOnlyList<Agent> definitions, IReadOnlyList<AIAgent> agents)
     {
         switch (workflow.Type)
         {

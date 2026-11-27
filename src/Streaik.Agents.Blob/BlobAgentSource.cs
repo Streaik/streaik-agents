@@ -12,7 +12,7 @@ public sealed class BlobAgentSource(BlobContainerClient container, string? prefi
     private readonly SemaphoreSlim _refresh = new(1, 1);
     private volatile Snapshot? _cache;
 
-    public async Task<IReadOnlyList<AgentDefinition>> GetAgentsAsync(CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<Agent>> GetAgentsAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (_cache is { } cached && _clock.GetUtcNow() < cached.ExpiresAt) return cached.Agents;
@@ -31,11 +31,11 @@ public sealed class BlobAgentSource(BlobContainerClient container, string? prefi
         }
     }
 
-    private async Task<IReadOnlyList<AgentDefinition>> LoadAsync(CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<Agent>> LoadAsync(CancellationToken cancellationToken)
     {
         if (!await container.ExistsAsync(cancellationToken)) return [];
 
-        var agents = new List<AgentDefinition>();
+        var agents = new List<Agent>();
         await foreach (var blob in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, _prefix, cancellationToken))
         {
             if (!blob.Name.EndsWith("Agent.json", StringComparison.OrdinalIgnoreCase)) continue;
@@ -46,5 +46,5 @@ public sealed class BlobAgentSource(BlobContainerClient container, string? prefi
         return agents.AsReadOnly();
     }
 
-    private sealed record Snapshot(IReadOnlyList<AgentDefinition> Agents, DateTimeOffset ExpiresAt);
+    private sealed record Snapshot(IReadOnlyList<Agent> Agents, DateTimeOffset ExpiresAt);
 }

@@ -38,7 +38,7 @@ internal static class AzureAgentAuth
 
 internal sealed class AzureGatewayHeaders(ITokenAcquisition acquisition, string[] scopes) : IAgentGatewayHeaders
 {
-    public async ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, AgentDefinition agent, CancellationToken cancellationToken)
+    public async ValueTask<IReadOnlyDictionary<string, string>> GetHeadersAsync(HttpContext context, Agent agent, CancellationToken cancellationToken)
     {
         if (context.User.Identity?.IsAuthenticated != true)
             throw new AgentGatewayAuthenticationException("An Entra access token is required.");

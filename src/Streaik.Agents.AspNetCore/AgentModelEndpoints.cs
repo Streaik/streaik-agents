@@ -53,7 +53,7 @@ internal static class AgentModelEndpoints
         error = new { code = "agent_catalog_unavailable", message = "The agent catalog is unavailable." }
     }, statusCode: 503);
 
-    private static AgentModelEntry Project(AgentDefinition agent, bool detail)
+    private static AgentModelEntry Project(Agent agent, bool detail)
     {
         var tags = agent.Tags;
         if (!detail && !string.IsNullOrWhiteSpace(agent.Transcription?.Id))
@@ -62,11 +62,23 @@ internal static class AgentModelEndpoints
             agent.Description, tags, detail ? PublishDefinition(agent) : null);
     }
 
-    private static AgentDefinition PublishDefinition(AgentDefinition agent)
+    private static Agent PublishDefinition(Agent agent)
     {
         // Project away known credential headers without modifying the cached source definition.
         var json = JsonSerializer.SerializeToNode(agent, JsonSerializerOptions.Web)!;
-        return RemoveCredentialHeaders(json) ? json.Deserialize<AgentDefinition>(JsonSerializerOptions.Web)! : agent;
+        var changed = RemoveCredentialHeaders(json);
+        if (json is JsonObject definition)
+        {
+            foreach (var name in definition.Select(pair => pair.Key).Where(Agent.IsRemovedField).ToArray()) changed |= definition.Remove(name);
+            if (definition["tools"] is JsonArray tools)
+                foreach (var entry in tools.OfType<JsonObject>().Where(tool => tool["type"] is JsonValue kind
+                    && kind.TryGetValue<string>(out var type) && type == "mcp"))
+                {
+                    changed |= entry.Remove("authorization");
+                    changed |= entry.Remove("headers");
+                }
+        }
+        return changed ? json.Deserialize<Agent>(JsonSerializerOptions.Web)! : agent;
     }
 
     private static bool RemoveCredentialHeaders(JsonNode? value)
@@ -108,7 +120,7 @@ internal sealed record AgentModelEntry(
     [property: JsonPropertyName("name"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Name,
     [property: JsonPropertyName("description"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Description,
     [property: JsonPropertyName("tags"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string[]? Tags,
-    [property: JsonPropertyName("agent"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] AgentDefinition? Agent)
+    [property: JsonPropertyName("agent"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] Agent? Agent)
 {
     [JsonPropertyName("object")]
     public string Object => "model";

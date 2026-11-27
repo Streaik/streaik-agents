@@ -1,12 +1,13 @@
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.Extensions.AI;
+using Streaik.Tools;
 using Streaik.Vercel.Models;
 
 namespace Streaik.Agents;
 
-internal sealed record AgentRunTarget(AgentDefinition Definition, AgentModel Model, IReadOnlyDictionary<string, string> Headers,
-    IReadOnlyList<AgentSkillBundle> Skills);
+internal sealed record AgentRunTarget(Agent Definition, AgentModel Model, IReadOnlyDictionary<string, string> Headers,
+    AgentHostedTools Tools, SkillArchiveResolver ResolveSkill);
 
 public sealed partial class AgentRuntime
 {
@@ -16,13 +17,13 @@ public sealed partial class AgentRuntime
 
     private static bool HasId(AgentModel? model) => !string.IsNullOrWhiteSpace(model?.Id);
 
-    private static AgentModel[] ConfiguredModels(AgentDefinition agent)
+    private static AgentModel[] ConfiguredModels(Agent agent)
     {
         var models = (agent.Models ?? []).OfType<AgentModel>().Where(HasId).DistinctBy(model => model.Id, StringComparer.Ordinal).ToArray();
         return models.Length != 0 ? models : HasId(agent.Model) ? [agent.Model!] : [];
     }
 
-    internal static IEnumerable<string> PotentialProviders(AgentDefinition agent)
+    internal static IEnumerable<string> PotentialProviders(Agent agent)
     {
         var models = ConfiguredModels(agent);
         if (NeedsCatalog(models))
@@ -49,7 +50,7 @@ public sealed partial class AgentRuntime
     }
 
     private static (AgentModel? Router, AgentModel[] Candidates, AgentModel? Fallback) Classify(
-        AgentDefinition agent, AgentModel[] models, Func<AgentModel, string?> typeOf)
+        Agent agent, AgentModel[] models, Func<AgentModel, string?> typeOf)
     {
         var candidates = models.Where(model => typeOf(model) == "language").ToArray();
         var router = models.FirstOrDefault(model => typeOf(model) == "decision");
@@ -58,8 +59,8 @@ public sealed partial class AgentRuntime
         return (router, candidates, candidates.FirstOrDefault() ?? models.FirstOrDefault(model => typeOf(model) is null) ?? legacy);
     }
 
-    internal async Task<IReadOnlyList<AgentRunTarget>> ResolveTargetsAsync(IReadOnlyList<AgentDefinition> agents, IReadOnlyList<ChatMessage> messages,
-        Func<AgentDefinition, AgentModel, bool, ValueTask<IReadOnlyDictionary<string, string>?>> headersFor, CancellationToken ct)
+    internal async Task<IReadOnlyList<AgentRunTarget>> ResolveTargetsAsync(IReadOnlyList<Agent> agents, IReadOnlyList<ChatMessage> messages,
+        Func<Agent, AgentModel, bool, ValueTask<IReadOnlyDictionary<string, string>?>> headersFor, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         var plans = agents.Select(agent => (Agent: agent, Models: ConfiguredModels(agent))).ToArray();
@@ -96,8 +97,17 @@ public sealed partial class AgentRuntime
                 answer = await SelectModelAsync(agent, router, candidates, catalog, messages, ModelHeaders(router, routerHeaders), ct) ?? answer;
 
             var headers = await headersFor(agent, answer, false) ?? EmptyHeaders;
-            var skills = await LoadSkillsAsync(agent, answer, headers, headersFor, ct);
-            targets.Add(new AgentRunTarget(agent, answer, ModelHeaders(answer, headers), skills));
+            var tools = AgentHostedTools.Read(agent);
+            var skillHeaders = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.Ordinal) { [GetProvider(answer)] = headers };
+            if (hostedAccess?.ResolveSkill is null)
+                foreach (var provider in SkillProviders(agent).Distinct(StringComparer.Ordinal))
+                    if (!skillHeaders.ContainsKey(provider))
+                        skillHeaders[provider] = await headersFor(agent, new AgentModel { Id = $"{provider}/skill" }, false) ?? EmptyHeaders;
+            targets.Add(new AgentRunTarget(agent, answer, ModelHeaders(answer, headers), tools, (reference, cancellationToken) =>
+            {
+                var (provider, path) = SkillRoute(reference);
+                return DownloadSkillAsync(path, ScopeHeaders(skillHeaders[provider], new(StringComparer.Ordinal) { provider }), cancellationToken);
+            }));
         }
         ct.ThrowIfCancellationRequested();
         return targets;
@@ -124,7 +134,7 @@ public sealed partial class AgentRuntime
         catch (Exception error) when (RoutingFailed(error, ct)) { return new(StringComparer.Ordinal); }
     }
 
-    private async Task<AgentModel?> SelectModelAsync(AgentDefinition agent, AgentModel router, AgentModel[] candidates,
+    private async Task<AgentModel?> SelectModelAsync(Agent agent, AgentModel router, AgentModel[] candidates,
         Dictionary<string, JsonElement> catalog, IReadOnlyList<ChatMessage> messages, IReadOnlyDictionary<string, string> headers, CancellationToken ct)
     {
         try

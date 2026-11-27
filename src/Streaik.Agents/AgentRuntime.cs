@@ -1,12 +1,13 @@
 using System.Runtime.CompilerServices;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
+using Streaik.Tools;
 
 namespace Streaik.Agents;
 
-public sealed partial class AgentRuntime(HttpClient gateway)
+public sealed partial class AgentRuntime(HttpClient gateway, HostedToolAccess? hostedAccess = null)
 {
-    public static string GetProvider(AgentDefinition agent) => GetProvider(HasId(agent.Model) ? agent.Model : ConfiguredModels(agent).FirstOrDefault());
+    public static string GetProvider(Agent agent) => GetProvider(HasId(agent.Model) ? agent.Model : ConfiguredModels(agent).FirstOrDefault());
 
     internal static string GetProvider(AgentModel? model)
     {
@@ -20,7 +21,7 @@ public sealed partial class AgentRuntime(HttpClient gateway)
         return id[..separator].ToLowerInvariant();
     }
 
-    internal static void Validate(AgentDefinition agent)
+    internal static void Validate(Agent agent)
     {
         if (string.IsNullOrWhiteSpace(agent.Name))
             throw new AgentRequestException("The agent's 'name' is required.");
@@ -31,15 +32,16 @@ public sealed partial class AgentRuntime(HttpClient gateway)
         if (models.All(model => model.Type == "decision") && agent.Model is not { Id.Length: > 0, Type: not "decision" })
             throw new AgentRequestException("An agent needs an answer model; decision models only select an answer model.");
         _ = GetTransport(agent);
+        _ = AgentHostedTools.Read(agent);
     }
 
-    private static string GetTransport(AgentDefinition agent) => agent.Transport switch
+    private static string GetTransport(Agent agent) => agent.Transport switch
     {
-        null or "responses" or AgentDefinition.DefaultTransport => AgentDefinition.DefaultTransport,
+        null or "responses" or Agent.DefaultTransport => Agent.DefaultTransport,
         _ => throw new AgentRequestException("Unsupported agent 'transport'. Only 'v1/responses' is supported.", "unsupported_transport")
     };
 
-    public async Task<AgentResponse> RunAsync(AgentDefinition definition, IEnumerable<ChatMessage> messages,
+    public async Task<AgentResponse> RunAsync(Agent definition, IEnumerable<ChatMessage> messages,
         IReadOnlyDictionary<string, string>? gatewayHeaders = null, ChatOptions? options = null,
         CancellationToken cancellationToken = default)
     {
@@ -49,7 +51,7 @@ public sealed partial class AgentRuntime(HttpClient gateway)
         return await RunResolvedAsync(targets[0], history, options, cancellationToken);
     }
 
-    public async IAsyncEnumerable<AgentResponseUpdate> StreamAsync(AgentDefinition definition, IEnumerable<ChatMessage> messages,
+    public async IAsyncEnumerable<AgentResponseUpdate> StreamAsync(Agent definition, IEnumerable<ChatMessage> messages,
         IReadOnlyDictionary<string, string>? gatewayHeaders = null, ChatOptions? options = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
@@ -59,25 +61,33 @@ public sealed partial class AgentRuntime(HttpClient gateway)
         await foreach (var update in StreamResolvedAsync(targets[0], history, options, cancellationToken)) yield return update;
     }
 
-    internal Task<AgentResponse> RunResolvedAsync(AgentRunTarget target, IEnumerable<ChatMessage> messages, ChatOptions? options, CancellationToken cancellationToken)
-        => CreateAgent(target).RunAsync(messages,
+    internal async Task<AgentResponse> RunResolvedAsync(AgentRunTarget target, IEnumerable<ChatMessage> messages, ChatOptions? options,
+        CancellationToken cancellationToken, AgentMcpApprovals? approvals = null)
+    {
+        await using var turn = await OpenToolsAsync(target, cancellationToken);
+        return await CreateAgent(target, turn, approvals: approvals).RunAsync(messages,
             options: options is null ? null : new ChatClientAgentRunOptions(options), cancellationToken: cancellationToken);
+    }
 
-    internal IAsyncEnumerable<AgentResponseUpdate> StreamResolvedAsync(AgentRunTarget target, IEnumerable<ChatMessage> messages, ChatOptions? options, CancellationToken cancellationToken)
-        => CreateAgent(target).RunStreamingAsync(messages,
-            options: options is null ? null : new ChatClientAgentRunOptions(options), cancellationToken: cancellationToken);
+    internal async IAsyncEnumerable<AgentResponseUpdate> StreamResolvedAsync(AgentRunTarget target, IEnumerable<ChatMessage> messages, ChatOptions? options,
+        [EnumeratorCancellation] CancellationToken cancellationToken, AgentMcpApprovals? approvals = null)
+    {
+        await using var turn = await OpenToolsAsync(target, cancellationToken);
+        await foreach (var update in CreateAgent(target, turn, approvals: approvals).RunStreamingAsync(messages,
+            options: options is null ? null : new ChatClientAgentRunOptions(options), cancellationToken: cancellationToken)) yield return update;
+    }
 
-    private ChatClientAgent CreateAgent(AgentRunTarget target, ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null)
+    private ChatClientAgent CreateAgent(AgentRunTarget target, HostedToolTurn? turn, ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null,
+        AgentMcpApprovals? approvals = null)
     {
         var definition = target.Definition;
-        var skills = target.Skills.Count > 0 ? new AgentSkillTools(target.Skills) : null;
         IChatClient client = GetTransport(definition) switch
         {
-            AgentDefinition.DefaultTransport => new ResponsesChatClient(gateway, target.Model, target.Headers, defaults, observeUsage,
-                skillCatalog: skills?.Catalog()),
+            Agent.DefaultTransport => new ResponsesChatClient(gateway, target.Model, target.Headers, defaults, observeUsage,
+                turn, target.Tools.Server, target.Tools.NativeMcp, approvals),
             _ => throw new InvalidOperationException("Agent transport was not registered.")
         };
         return new ChatClientAgent(client, instructions: definition.Instructions,
-            name: definition.Name, description: definition.Description, tools: skills?.Functions());
+            name: definition.Name, description: definition.Description);
     }
 }

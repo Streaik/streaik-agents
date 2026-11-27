@@ -6,20 +6,26 @@ using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.AI;
 using Streaik.Responses;
 using Streaik.Responses.Streaming;
+using Streaik.Tools;
 using Streaik.Vercel.Models;
+using Streaik.Vercel.Security;
 
 namespace Streaik.Agents.AspNetCore;
 
-internal sealed class AgentOutput(HttpResponse response, string name, bool ui, CancellationToken cancellationToken)
+internal sealed class AgentOutput(HttpResponse response, string name, bool ui, CancellationToken cancellationToken, ToolApprovalSigner? signer = null)
 {
     private readonly string _id = $"resp_{Guid.NewGuid():N}";
     private readonly string _messageId = $"msg_{Guid.NewGuid():N}";
     private readonly long _created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
     private readonly StringBuilder _text = new();
     private UsageDetails? _usage;
+    private readonly HashSet<string> _browserCalls = new(StringComparer.Ordinal);
+    private readonly List<ResponseInputItem> _nativeItems = [];
+    private bool _review;
     private int _sequence;
 
-    public ResponseResult Snapshot(string status, string? text = null, UsageDetails? usage = null, ResponseResultError? error = null) => new()
+    public ResponseResult Snapshot(string status, string? text = null, UsageDetails? usage = null, ResponseResultError? error = null,
+        IEnumerable<ResponseInputItem>? nativeItems = null) => new()
     {
         Id = _id,
         Model = name,
@@ -28,11 +34,11 @@ internal sealed class AgentOutput(HttpResponse response, string name, bool ui, C
         Status = status,
         Store = false,
         Error = error,
-        Output = string.IsNullOrEmpty(text) ? [] : [new ResponseInputMessage
+        Output = [.. (string.IsNullOrEmpty(text) ? Array.Empty<ResponseInputItem>() : new ResponseInputItem[] { new ResponseInputMessage
         {
             Id = _messageId, Role = ResponseRole.Assistant, Status = status,
             Content = new ResponseMessageContent([new OutputTextPart(text)])
-        }],
+        } }), .. (nativeItems ?? _nativeItems)],
         Usage = usage is null ? null : new ResponseUsage
         {
             InputTokens = (int?)usage.InputTokenCount,
@@ -59,6 +65,34 @@ internal sealed class AgentOutput(HttpResponse response, string name, bool ui, C
         foreach (var part in update.Contents)
         {
             if (part is UsageContent usage) _usage = usage.Details;
+            if (ui && part is BrowserFunctionCall function && _browserCalls.Add(function.CallId))
+            {
+                var call = new ToolCallPart { ToolCallId = function.CallId, ToolName = function.Name, Input = function.Arguments ?? new Dictionary<string, object?>(),
+                    ProviderExecuted = false, Dynamic = true };
+                var id = Guid.NewGuid().ToString("N");
+                await EventAsync(call);
+                await EventAsync(new ToolApprovalRequestUIPart { ToolCallId = call.ToolCallId, ApprovalId = id,
+                    Signature = signer!.CreateSignature(id, call) });
+            }
+            if (!ui && part is NativeResponseContent native)
+            {
+                _nativeItems.Add(native.Item);
+                var item = JsonSerializer.SerializeToElement(native.Item, ResponseJson.Default).Deserialize<ResponseStreamItem>(ResponseJson.Default)!;
+                await EventAsync(new ResponseOutputItemDone { Item = item, OutputIndex = _nativeItems.Count - 1 + (_text.Length > 0 ? 1 : 0),
+                    SequenceNumber = _sequence++ });
+            }
+            if (ui && part is McpReviewContent reviewed)
+            {
+                _review = true;
+                var review = reviewed.Review;
+                var call = new ToolCallPart { ToolCallId = review.Id, ToolName = McpResultReviews.ToolName,
+                    Title = $"Review MCP result: {review.Name}", ProviderExecuted = true, Dynamic = true,
+                    Input = review.Input, ToolMetadata = new() { ["mcpReviewOutput"] = review.Output!.Value } };
+                await EventAsync(call);
+                await EventAsync(new ToolApprovalRequestUIPart { ToolCallId = review.Id, ApprovalId = review.Id,
+                    Reason = "Review the completed MCP result before sending it to the model.",
+                    ApprovalDescriptor = new { server = review.Server, name = review.Name, input = review.Input, output = review.Output } });
+            }
             if (part is not TextContent { Text.Length: > 0 } text) continue;
             if (_text.Length == 0) await StartTextAsync();
             _text.Append(text.Text);
@@ -72,7 +106,7 @@ internal sealed class AgentOutput(HttpResponse response, string name, bool ui, C
         if (ui)
         {
             if (_text.Length != 0) await EventAsync(new TextEndUIMessageStreamPart { Id = _messageId });
-            await EventAsync(new { type = "finish", finishReason = "stop" });
+            await EventAsync(new { type = "finish", finishReason = _browserCalls.Count == 0 && !_review ? "stop" : "tool-calls" });
         }
         else
         {

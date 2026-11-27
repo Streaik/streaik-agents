@@ -4,12 +4,15 @@ using Microsoft.Extensions.AI;
 using Streaik.Responses;
 using Streaik.Responses.Extensions;
 using Streaik.Responses.Streaming;
+using Streaik.Tools;
 
 namespace Streaik.Agents;
 
 internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, IReadOnlyDictionary<string, string>? headers,
-    ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null, string? skillCatalog = null) : IChatClient
+    ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null, HostedToolTurn? hosted = null,
+    HostedToolDefinition[]? gatewayTools = null, ResponseToolDefinition[]? nativeTools = null, AgentMcpApprovals? approvals = null) : IChatClient
 {
+    private const int MaximumToolRounds = 12;
     private static readonly HashSet<string> ProtectedFields = new(StringComparer.OrdinalIgnoreCase)
     {
         "model", "input", "instructions", "stream", "store", "background", "previous_response_id", "previousResponseId", "conversation",
@@ -19,15 +22,24 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
     public async Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
         CancellationToken cancellationToken = default)
     {
-        var result = await gateway.GetResponses(CreateRequest(messages, options, stream: false), providerId: null,
-            relativeUrl: AgentDefinition.DefaultTransport, headers: headers, ct: cancellationToken);
-        CheckResult(result);
+        var input = messages.SelectMany(MapMessage).ToList();
+        ResponseResult result;
+        List<AIContent> review;
+        UsageDetails? usage = null;
+        for (var round = 0; ; round++)
+        {
+            result = await gateway.GetResponses(CreateRequest(input, options, stream: false), providerId: null,
+                relativeUrl: Agent.DefaultTransport, headers: headers, ct: cancellationToken);
+            CheckResult(result);
+            AddUsage(result, ref usage);
+            review = await ReadApprovalsAsync(result, cancellationToken);
+            if (review.Count > 0 || !await ContinueHostedAsync(result, input, round, options, cancellationToken)) break;
+        }
         var calls = GetFunctionCalls(result, options).ToList();
         var contents = new List<AIContent>();
         if (GetText(result) is { Length: > 0 } text) contents.Add(new TextContent(text));
         contents.AddRange(calls);
-        var usage = GetUsage(result);
-        if (usage is not null) observeUsage?.Invoke(usage);
+        contents.AddRange(review);
         return new ChatResponse(new ChatMessage(ChatRole.Assistant, contents))
         {
             ModelId = result.Model,
@@ -40,58 +52,120 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
     public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages,
         ChatOptions? options = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var hasText = false;
-        await foreach (var part in gateway.GetResponsesUpdates(CreateRequest(messages, options, stream: true),
-            providerId: string.Empty, relativeUrl: AgentDefinition.DefaultTransport, headers: headers, ct: cancellationToken))
+        var input = messages.SelectMany(MapMessage).ToList();
+        UsageDetails? usage = null;
+        for (var round = 0; ; round++)
         {
-            switch (part)
+            var hasText = false;
+            ResponseResult? result = null;
+            await foreach (var part in gateway.GetResponsesUpdates(CreateRequest(input, options, stream: true),
+                providerId: string.Empty, relativeUrl: Agent.DefaultTransport, headers: headers, ct: cancellationToken))
             {
-                case ResponseOutputTextDelta { Delta.Length: > 0 } delta:
+                if (part is ResponseOutputTextDelta { Delta.Length: > 0 } delta)
+                {
                     hasText = true;
                     yield return new ChatResponseUpdate(ChatRole.Assistant, delta.Delta);
-                    break;
-                case ResponseCompleted completed:
-                    CheckResult(completed.Response);
-                    // Some compatible upstreams emit only a final snapshot.
-                    if (!hasText && GetText(completed.Response) is { Length: > 0 } text)
-                        yield return new ChatResponseUpdate(ChatRole.Assistant, text);
-                    var calls = GetFunctionCalls(completed.Response, options).ToList();
-                    var terminal = new ChatResponseUpdate
-                    {
-                        Role = ChatRole.Assistant,
-                        ModelId = completed.Response.Model,
-                        ResponseId = completed.Response.Id,
-                        FinishReason = calls.Count == 0 ? ChatFinishReason.Stop : ChatFinishReason.ToolCalls
-                    };
-                    foreach (var call in calls) terminal.Contents.Add(call);
-                    if (GetUsage(completed.Response) is { } usage)
-                    {
-                        observeUsage?.Invoke(usage);
-                        terminal.Contents.Add(new UsageContent(usage));
-                    }
-                    yield return terminal;
-                    yield break;
-                case ResponseFailed or ResponseError or ResponseIncompleteEvent:
+                }
+                else if (part is ResponseCompleted completed) { result = completed.Response; break; }
+                else if (part is ResponseFailed or ResponseError or ResponseIncompleteEvent)
                     throw new InvalidOperationException("The upstream did not complete the response.");
             }
+            cancellationToken.ThrowIfCancellationRequested();
+            if (result is null) throw new InvalidOperationException("The upstream stream closed without a terminal response.");
+            CheckResult(result);
+            AddUsage(result, ref usage);
+            if (!hasText && GetText(result) is { Length: > 0 } text) yield return new ChatResponseUpdate(ChatRole.Assistant, text);
+            var review = await ReadApprovalsAsync(result, cancellationToken);
+            if (review.Count == 0 && await ContinueHostedAsync(result, input, round, options, cancellationToken)) continue;
+            var calls = GetFunctionCalls(result, options).ToList();
+            var terminal = new ChatResponseUpdate
+            {
+                Role = ChatRole.Assistant, ModelId = result.Model, ResponseId = result.Id,
+                FinishReason = calls.Count == 0 ? ChatFinishReason.Stop : ChatFinishReason.ToolCalls
+            };
+            foreach (var call in calls) terminal.Contents.Add(call);
+            foreach (var item in review) terminal.Contents.Add(item);
+            if (usage is not null) terminal.Contents.Add(new UsageContent(usage));
+            yield return terminal;
+            yield break;
         }
-
-        cancellationToken.ThrowIfCancellationRequested();
-        throw new InvalidOperationException("The upstream stream closed without a terminal response.");
     }
 
-    private ResponseRequest CreateRequest(IEnumerable<ChatMessage> messages, ChatOptions? options, bool stream)
+    private Task<List<AIContent>> ReadApprovalsAsync(ResponseResult result, CancellationToken ct)
     {
+        if (!result.OutputItems.OfType<ResponseMcpApprovalRequestItem>().Any()) return Task.FromResult<List<AIContent>>([]);
+        if (hosted is not null && result.OutputItems.OfType<ResponseFunctionCallItem>().Any(call => hosted.Owns(call.Name)))
+            throw new InvalidOperationException("The upstream mixed an approval with a backend tool call.");
+        return approvals?.ObserveAsync(result, ct) ?? throw new AgentRequestException(
+            "The upstream requested MCP approval on a route that cannot continue it.", "mcp_approval_required");
+    }
+
+    private async Task<bool> ContinueHostedAsync(ResponseResult result, List<ResponseInputItem> input, int round, ChatOptions? options, CancellationToken ct)
+    {
+        if (hosted is null) return false;
+        var calls = result.OutputItems.OfType<ResponseFunctionCallItem>().ToArray();
+        if (!calls.Any(call => hosted.Owns(call.Name))) return false;
+        if (round >= MaximumToolRounds || calls.Length != 1 || calls[0].Namespace is not null || string.IsNullOrEmpty(calls[0].CallId)
+            || options?.ToolMode is NoneChatToolMode
+            || options?.ToolMode is RequiredChatToolMode { RequiredFunctionName: { } name } && calls[0].Name != name)
+            throw new InvalidOperationException("The gateway returned an unexpected hosted tool call.");
+        var call = calls[0];
+        using var arguments = JsonDocument.Parse(call.Arguments);
+        if (await hosted.InvokeAsync(call.Name, call.CallId, arguments.RootElement, ct) is not McpCallOutcome.Completed completed)
+            throw new AgentRequestException("This MCP call requires approval before execution and was not dispatched.", "mcp_approval_required");
+        if (GetText(result) is { Length: > 0 } text)
+            input.Add(new ResponseInputMessage { Role = ResponseRole.Assistant, Content = new ResponseMessageContent([new OutputTextPart(text)]) });
+        input.Add(new ResponseFunctionCallItem { CallId = call.CallId, Name = call.Name, Arguments = call.Arguments });
+        input.Add(new ResponseFunctionCallOutputItem { CallId = call.CallId, Output = completed.Output.GetRawText() });
+        if (input.RemoveAll(item => item is ResponseMcpApprovalResponseItem) > 0)
+            input.AddRange(result.OutputItems.OfType<ResponseMcpCallItem>());
+        return true;
+    }
+
+    private void AddUsage(ResponseResult result, ref UsageDetails? total)
+    {
+        if (GetUsage(result) is not { } usage) return;
+        observeUsage?.Invoke(usage);
+        (total ??= new UsageDetails()).Add(usage);
+    }
+
+    private ResponseRequest CreateRequest(IEnumerable<ResponseInputItem> input, ChatOptions? options, bool stream)
+    {
+        var enableTools = options?.ToolMode is not NoneChatToolMode;
+        var functions = options?.Tools?.OfType<AIFunctionDeclaration>().Select(FunctionTool).ToList();
+        if (enableTools && hosted is not null)
+        {
+            foreach (var tool in hosted.Functions())
+            {
+                if (options?.Tools?.OfType<AIFunctionDeclaration>().Any(f => f.Name == tool.Name) == true)
+                    throw new AgentRequestException("A function name collides with an agent-hosted tool.", "invalid_agent_tool");
+                (functions ??= []).Add(FunctionTool(tool.Name, tool.Description, tool.InputSchema));
+            }
+        }
+        if (enableTools && gatewayTools is { Length: > 0 })
+        {
+            functions ??= [];
+            foreach (var tool in gatewayTools)
+            {
+                var descriptor = JsonSerializer.SerializeToElement<HostedToolDefinition>(tool, HostedToolsJson.Options);
+                var type = descriptor.GetProperty("type").GetString()!;
+                functions.Add(new ResponseToolDefinition { Type = type, Extra = descriptor.EnumerateObject()
+                    .Where(field => field.Name != "type").ToDictionary(field => field.Name, field => field.Value, StringComparer.Ordinal) });
+                functions[^1].Extra!["name"] = JsonSerializer.SerializeToElement(type);
+            }
+        }
+        if (enableTools && nativeTools is { Length: > 0 }) (functions ??= []).AddRange(nativeTools);
         var request = new ResponseRequest
         {
             Model = model.Id,
-            Instructions = skillCatalog is null ? options?.Instructions : string.IsNullOrWhiteSpace(options?.Instructions)
-                ? skillCatalog : $"{options.Instructions}\n\n{skillCatalog}",
-            Input = new ResponseInput(messages.SelectMany(MapMessage)),
+            Instructions = !enableTools || hosted?.Instructions is not { } catalog ? options?.Instructions : string.IsNullOrWhiteSpace(options?.Instructions)
+                ? catalog : $"{options.Instructions}\n\n{catalog}",
+            Input = new ResponseInput(input),
             Temperature = options?.Temperature ?? defaults?.Temperature ?? model.Options?.Temperature,
             TopP = options?.TopP ?? defaults?.TopP,
             MaxOutputTokens = options?.MaxOutputTokens ?? defaults?.MaxOutputTokens,
-            Tools = options?.Tools?.OfType<AIFunctionDeclaration>().Select(FunctionTool).ToList(),
+            Tools = functions,
+            ParallelToolCalls = enableTools && (hosted is not null || gatewayTools is { Length: > 0 }) ? false : null,
             ToolChoice = options?.ToolMode switch
             {
                 RequiredChatToolMode { RequiredFunctionName: { } name } => new { type = "function", name },
@@ -140,17 +214,25 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
         foreach (var call in message.Contents.OfType<FunctionCallContent>())
             yield return new ResponseFunctionCallItem { CallId = call.CallId, Name = call.Name, Arguments = JsonSerializer.Serialize(call.Arguments ?? new Dictionary<string, object?>()) };
         foreach (var result in message.Contents.OfType<FunctionResultContent>())
-            yield return new ResponseFunctionCallOutputItem { CallId = result.CallId, Output = result.Result as string ?? JsonSerializer.Serialize(result.Result) };
+            yield return new ResponseFunctionCallOutputItem { CallId = result.CallId, Output = result.Result switch
+            {
+                string plain => plain,
+                JsonElement { ValueKind: JsonValueKind.String } value => value.GetString()!,
+                _ => JsonSerializer.Serialize(result.Result)
+            } };
+        foreach (var native in message.Contents.OfType<NativeResponseContent>()) yield return native.Item;
     }
 
-    private static ResponseToolDefinition FunctionTool(AIFunctionDeclaration tool) => new()
+    private static ResponseToolDefinition FunctionTool(AIFunctionDeclaration tool) => FunctionTool(tool.Name, tool.Description, tool.JsonSchema);
+
+    private static ResponseToolDefinition FunctionTool(string name, string? description, JsonElement schema) => new()
     {
         Type = "function",
         Extra = new()
         {
-            ["name"] = JsonSerializer.SerializeToElement(tool.Name),
-            ["description"] = JsonSerializer.SerializeToElement(tool.Description),
-            ["parameters"] = tool.JsonSchema,
+            ["name"] = JsonSerializer.SerializeToElement(name),
+            ["description"] = JsonSerializer.SerializeToElement(description),
+            ["parameters"] = schema,
             ["strict"] = JsonSerializer.SerializeToElement(false)
         }
     };
@@ -164,7 +246,8 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
                 throw new InvalidOperationException("The gateway returned an unexpected function call.");
             var arguments = JsonSerializer.Deserialize<Dictionary<string, object?>>(call.Arguments)
                 ?? throw new JsonException("Function call arguments must be a JSON object.");
-            yield return new FunctionCallContent(call.CallId, call.Name, arguments);
+            yield return options!.Tools!.OfType<BrowserFunction>().Any(tool => tool.Name == call.Name)
+                ? new BrowserFunctionCall(call.CallId, call.Name, arguments) : new FunctionCallContent(call.CallId, call.Name, arguments);
         }
     }
 
