@@ -65,6 +65,14 @@ internal sealed class AgentOutput(HttpResponse response, string name, bool ui, C
         foreach (var part in update.Contents)
         {
             if (part is UsageContent usage) _usage = usage.Details;
+            if (ui && part is HostedToolActivityContent hosted)
+                await EventAsync<UIMessagePart>(hosted.Activity switch
+                {
+                    { Error: { } error } activity => new ToolOutputErrorPart { ToolCallId = activity.CallId, ErrorText = error, ProviderExecuted = true, Dynamic = true },
+                    { Output: { } output } activity => new ToolOutputAvailablePart { ToolCallId = activity.CallId, Output = output, ProviderExecuted = true, Dynamic = true },
+                    var activity => new ToolCallPart { ToolCallId = activity.CallId, ToolName = activity.Name, Input = activity.Input, ProviderExecuted = true, Dynamic = true,
+                        ToolMetadata = new() { [HostedToolActivity.UiMetadataKey] = JsonSerializer.SerializeToElement(true) } }
+                });
             if (ui && part is BrowserFunctionCall function && _browserCalls.Add(function.CallId))
             {
                 var call = new ToolCallPart { ToolCallId = function.CallId, ToolName = function.Name, Input = function.Arguments ?? new Dictionary<string, object?>(),

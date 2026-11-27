@@ -70,21 +70,21 @@ public sealed partial class AgentRuntime(HttpClient gateway, HostedToolAccess? h
     }
 
     internal async IAsyncEnumerable<AgentResponseUpdate> StreamResolvedAsync(AgentRunTarget target, IEnumerable<ChatMessage> messages, ChatOptions? options,
-        [EnumeratorCancellation] CancellationToken cancellationToken, AgentMcpApprovals? approvals = null)
+        [EnumeratorCancellation] CancellationToken cancellationToken, AgentMcpApprovals? approvals = null, bool reportHostedActivity = false)
     {
         await using var turn = await OpenToolsAsync(target, cancellationToken);
-        await foreach (var update in CreateAgent(target, turn, approvals: approvals).RunStreamingAsync(messages,
+        await foreach (var update in CreateAgent(target, turn, approvals: approvals, reportHostedActivity: reportHostedActivity).RunStreamingAsync(messages,
             options: options is null ? null : new ChatClientAgentRunOptions(options), cancellationToken: cancellationToken)) yield return update;
     }
 
     private ChatClientAgent CreateAgent(AgentRunTarget target, HostedToolTurn? turn, ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null,
-        AgentMcpApprovals? approvals = null)
+        AgentMcpApprovals? approvals = null, bool reportHostedActivity = false)
     {
         var definition = target.Definition;
         IChatClient client = GetTransport(definition) switch
         {
             Agent.DefaultTransport => new ResponsesChatClient(gateway, target.Model, target.Headers, defaults, observeUsage,
-                turn, target.Tools.Server, target.Tools.NativeMcp, approvals),
+                turn, target.Tools.Server, target.Tools.NativeMcp, approvals, reportHostedActivity),
             _ => throw new InvalidOperationException("Agent transport was not registered.")
         };
         return new ChatClientAgent(client, instructions: definition.Instructions,

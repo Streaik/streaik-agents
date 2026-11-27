@@ -2,6 +2,7 @@ using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
+using Streaik.Tools;
 
 namespace Streaik.Agents.Tests;
 
@@ -38,6 +39,58 @@ public sealed class AgentSkillTests
     }
 
     [Theory]
+    [InlineData(Chat)]
+    [InlineData(Responses)]
+    public async Task Only_API_Chat_opts_into_and_relays_gateway_hosted_activity(string endpoint)
+    {
+        await using var host = await TestAgentHost.StartAsync();
+        const string callId = "call_delegated";
+        host.Gateway.Respond = call =>
+        {
+            var completed = GatewayFixture.Completed.ReplaceLineEndings("");
+            string Frame(string id, object? output = null) => "data: " + JsonSerializer.Serialize(new
+            {
+                type = HostedToolActivity.ResponsesEvent,
+                activity = new { name = "streaik_activate_skill", callId = id, input = new { skill_id = RemoteId }, output }
+            }) + "\n\n";
+            var prefix = call.Headers.ContainsKey(HostedToolActivity.ResponsesHeader)
+                ? Frame(callId) + Frame("wrong_id", new { value = "Unmatched output" }) + Frame(callId, new { value = "Hosted skill result" }) : "";
+            return GatewayFixture.Reply(prefix + $$"""
+                data: {"type":"response.completed","response":{{completed}}}
+
+                data: [DONE]
+
+                """, stream: true);
+        };
+        var agent = new { name = "Delegated", model = new { id = "openai/test" }, tools = new[]
+        {
+            new { type = "skills", execution = "server", skills = new[] { Inline(Bundle("planning", "Plan.", InlineInstructions)) } }
+        } };
+        using var request = TestAgentHost.Post(endpoint, endpoint == Chat
+            ? new { agent, stream = true, messages = new[] { new { id = "u", role = "user", parts = new[] { new { type = "text", text = "hello" } } } } }
+            : (object)new { agent, stream = true, input = "hello" });
+        request.Headers.Add("x-openai-key", "answer-key");
+        using var response = await host.Client.SendAsync(request);
+        var wire = await response.Content.ReadAsStringAsync();
+        Assert.True(response.IsSuccessStatusCode, wire);
+        var upstream = Assert.Single(host.Gateway.Calls);
+        Assert.Equal(endpoint == Chat, upstream.Headers.ContainsKey(HostedToolActivity.ResponsesHeader));
+        Assert.Contains("Hello there", wire);
+        Assert.DoesNotContain("Unmatched output", wire);
+        Assert.DoesNotContain("tool-approval-request", wire);
+        Assert.DoesNotContain(HostedToolActivity.ResponsesEvent, wire);
+        var activity = ToolFrames(wire);
+        if (endpoint != Chat) { Assert.Empty(activity); return; }
+        Assert.Collection(activity,
+            call => AssertActivity(call, "tool-input-available", callId),
+            output => AssertActivity(output, "tool-output-available", callId));
+        Assert.Equal("streaik_activate_skill", activity[0].GetProperty("toolName").GetString());
+        Assert.Equal(RemoteId, activity[0].GetProperty("input").GetProperty("skill_id").GetString());
+        Assert.Equal("Hosted skill result", activity[1].GetProperty("output").GetProperty("value").GetString());
+        Assert.True(wire.IndexOf("Hosted skill result", StringComparison.Ordinal) < wire.IndexOf("Hello there", StringComparison.Ordinal));
+    }
+
+    [Theory]
     [InlineData(Chat, true, null)]
     [InlineData(Responses, false, "2")]
     [InlineData(Responses, true, "latest")]
@@ -64,6 +117,20 @@ public sealed class AgentSkillTests
         var responseText = await result.Content.ReadAsStringAsync();
         Assert.True(result.IsSuccessStatusCode, responseText);
         Assert.Contains("Skill run complete", responseText);
+        Assert.DoesNotContain("tool-approval-request", responseText);
+        var activity = ToolFrames(responseText);
+        if (endpoint == Chat)
+        {
+            Assert.Equal(8, activity.Length);
+            for (var i = 1; i <= 4; i++)
+            {
+                AssertActivity(activity[(i - 1) * 2], "tool-input-available", $"call_{i}");
+                AssertActivity(activity[(i - 1) * 2 + 1], "tool-output-available", $"call_{i}");
+            }
+            Assert.Equal("read_skill_resource", activity[4].GetProperty("toolName").GetString());
+            Assert.Equal(ResourceText, activity[5].GetProperty("output").GetProperty("structuredContent").GetProperty("skillResource").GetProperty("text").GetString());
+        }
+        else Assert.Empty(activity);
 
         var calls = host.Gateway.Calls.ToArray();
         Assert.Equal(6, calls.Length);
@@ -203,6 +270,19 @@ public sealed class AgentSkillTests
 
     private static HttpResponseMessage ToolCall(GatewayCall call, int id, string name, object args) => GatewayFixture.Complete(call,
         [new { type = "function_call", call_id = $"call_{id}", name, arguments = JsonSerializer.Serialize(args) }]);
+
+    private static JsonElement[] ToolFrames(string wire) => wire.Split('\n')
+        .Where(line => line.StartsWith("data: {", StringComparison.Ordinal))
+        .Select(line => JsonSerializer.Deserialize<JsonElement>(line[6..]))
+        .Where(frame => frame.GetProperty("type").GetString()!.StartsWith("tool-", StringComparison.Ordinal)).ToArray();
+
+    private static void AssertActivity(JsonElement frame, string type, string callId)
+    {
+        Assert.Equal(type, frame.GetProperty("type").GetString());
+        Assert.Equal(callId, frame.GetProperty("toolCallId").GetString());
+        Assert.True(frame.GetProperty("providerExecuted").GetBoolean());
+        Assert.True(frame.GetProperty("dynamic").GetBoolean());
+    }
 
     private static JsonElement ReadOutput(GatewayCall call, int id)
     {

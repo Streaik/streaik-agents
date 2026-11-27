@@ -54,7 +54,7 @@ public sealed partial class AgentRuntime
 
     internal async IAsyncEnumerable<AgentResponseUpdate> RunWorkflowAsync(AgentWorkflow workflow,
         IReadOnlyList<AgentRunTarget> targets, List<ChatMessage> messages, ChatOptions? options, bool stream,
-        [EnumeratorCancellation] CancellationToken ct)
+        [EnumeratorCancellation] CancellationToken ct, bool reportHostedActivity = false)
     {
         var usage = new UsageDetails();
         var hasUsage = false;
@@ -64,14 +64,14 @@ public sealed partial class AgentRuntime
         {
             var turn = await OpenToolsAsync(target, ct);
             if (turn is not null) turns.Items.Add(turn);
-            agents.Add(CreateAgent(target, turn, options, ObserveUsage));
+            agents.Add(CreateAgent(target, turn, options, ObserveUsage, reportHostedActivity: reportHostedActivity));
         }
         var graph = BuildWorkflow(workflow, targets.Select(target => target.Definition).ToArray(), agents);
         // Our endpoints expose one text item. Use the aggregated output for concurrent branches
         // to avoid interleaving their tokens, and the final answer for Magentic to keep planning private.
         var live = stream && workflow.Type is not ("concurrent" or "magentic");
         await using var run = await InProcessExecution.RunStreamingAsync(graph, messages, cancellationToken: ct);
-        await run.TrySendMessageAsync(new TurnToken(emitEvents: live));
+        await run.TrySendMessageAsync(new TurnToken(emitEvents: live || reportHostedActivity));
 
         var textEmitted = false;
         string? author = null;
@@ -83,6 +83,10 @@ public sealed partial class AgentRuntime
             {
                 case WorkflowErrorEvent error:
                     throw error.Exception ?? new InvalidOperationException("The workflow failed.");
+                case AgentResponseUpdateEvent { Update: var activity } when reportHostedActivity
+                    && activity.Contents.OfType<HostedToolActivityContent>().Any():
+                    yield return new AgentResponseUpdate { Contents = activity.Contents.OfType<HostedToolActivityContent>().Cast<AIContent>().ToList() };
+                    break;
                 case AgentResponseUpdateEvent { Update: var update } when live && update.Contents.OfType<TextContent>().Any(text => text.Text.Length != 0):
                     if (textEmitted && (author != update.AuthorName || lastResponseId != update.ResponseId))
                         yield return new AgentResponseUpdate(ChatRole.Assistant, "\n\n");

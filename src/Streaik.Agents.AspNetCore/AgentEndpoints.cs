@@ -100,8 +100,8 @@ public static class AgentEndpoints
             }
 
             var updates = participants.Count == 1
-                ? runtime.StreamResolvedAsync(primary, input.Messages, input.Options, ct, input.Mcp)
-                : runtime.RunWorkflowAsync(input.Workflow, targets, input.Messages.ToList(), input.Options, input.Stream, ct);
+                ? runtime.StreamResolvedAsync(primary, input.Messages, input.Options, ct, input.Mcp, reportHostedActivity: ui)
+                : runtime.RunWorkflowAsync(input.Workflow, targets, input.Messages.ToList(), input.Options, input.Stream, ct, reportHostedActivity: ui);
             if (!input.Stream)
             {
                 var text = new StringBuilder();

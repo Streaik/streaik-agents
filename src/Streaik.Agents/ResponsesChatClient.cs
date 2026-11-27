@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Threading.Channels;
 using Microsoft.Extensions.AI;
 using Streaik.Responses;
 using Streaik.Responses.Extensions;
@@ -10,7 +11,8 @@ namespace Streaik.Agents;
 
 internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, IReadOnlyDictionary<string, string>? headers,
     ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null, HostedToolTurn? hosted = null,
-    HostedToolDefinition[]? gatewayTools = null, ResponseToolDefinition[]? nativeTools = null, AgentMcpApprovals? approvals = null) : IChatClient
+    HostedToolDefinition[]? gatewayTools = null, ResponseToolDefinition[]? nativeTools = null, AgentMcpApprovals? approvals = null,
+    bool reportHostedActivity = false) : IChatClient
 {
     private const int MaximumToolRounds = 12;
     private static readonly HashSet<string> ProtectedFields = new(StringComparer.OrdinalIgnoreCase)
@@ -54,12 +56,21 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
     {
         var input = messages.SelectMany(MapMessage).ToList();
         UsageDetails? usage = null;
+        var relay = reportHostedActivity && gatewayTools is { Length: > 0 } && options?.ToolMode is not NoneChatToolMode;
+        var streamHeaders = headers;
+        if (relay)
+        {
+            var withActivity = new Dictionary<string, string>(headers ?? AgentRuntime.EmptyHeaders, StringComparer.OrdinalIgnoreCase)
+                { [HostedToolActivity.ResponsesHeader] = "1" };
+            streamHeaders = withActivity;
+        }
         for (var round = 0; ; round++)
         {
             var hasText = false;
             ResponseResult? result = null;
+            HostedToolActivity? gatewayCall = null;
             await foreach (var part in gateway.GetResponsesUpdates(CreateRequest(input, options, stream: true),
-                providerId: string.Empty, relativeUrl: Agent.DefaultTransport, headers: headers, ct: cancellationToken))
+                providerId: string.Empty, relativeUrl: Agent.DefaultTransport, headers: streamHeaders, ct: cancellationToken))
             {
                 if (part is ResponseOutputTextDelta { Delta.Length: > 0 } delta)
                 {
@@ -69,6 +80,20 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
                 else if (part is ResponseCompleted completed) { result = completed.Response; break; }
                 else if (part is ResponseFailed or ResponseError or ResponseIncompleteEvent)
                     throw new InvalidOperationException("The upstream did not complete the response.");
+                else if (relay && ReadGatewayActivity(part) is { } activity)
+                {
+                    if (activity.Output is null && activity.Error is null && gatewayCall is null)
+                    {
+                        gatewayCall = activity;
+                        yield return ActivityUpdate(activity);
+                    }
+                    else if (gatewayCall is { } pending && pending.CallId == activity.CallId && pending.Name == activity.Name
+                        && (activity.Output is not null || activity.Error is not null))
+                    {
+                        gatewayCall = null;
+                        yield return ActivityUpdate(pending with { Output = activity.Output, Error = activity.Error });
+                    }
+                }
             }
             cancellationToken.ThrowIfCancellationRequested();
             if (result is null) throw new InvalidOperationException("The upstream stream closed without a terminal response.");
@@ -76,7 +101,16 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             AddUsage(result, ref usage);
             if (!hasText && GetText(result) is { Length: > 0 } text) yield return new ChatResponseUpdate(ChatRole.Assistant, text);
             var review = await ReadApprovalsAsync(result, cancellationToken);
-            if (review.Count == 0 && await ContinueHostedAsync(result, input, round, options, cancellationToken)) continue;
+            if (review.Count == 0 && HostedCall(result, round, options) is { } localCall)
+            {
+                if (reportHostedActivity)
+                {
+                    await foreach (var activity in InvokeWithActivityAsync(result, localCall, input, cancellationToken))
+                        yield return ActivityUpdate(activity);
+                }
+                else await InvokeHostedAsync(result, localCall, input, null, cancellationToken);
+                continue;
+            }
             var calls = GetFunctionCalls(result, options).ToList();
             var terminal = new ChatResponseUpdate
             {
@@ -102,16 +136,31 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
 
     private async Task<bool> ContinueHostedAsync(ResponseResult result, List<ResponseInputItem> input, int round, ChatOptions? options, CancellationToken ct)
     {
-        if (hosted is null) return false;
+        if (HostedCall(result, round, options) is not { } call) return false;
+        await InvokeHostedAsync(result, call, input, null, ct);
+        return true;
+    }
+
+    private ResponseFunctionCallItem? HostedCall(ResponseResult result, int round, ChatOptions? options)
+    {
+        if (hosted is null) return null;
         var calls = result.OutputItems.OfType<ResponseFunctionCallItem>().ToArray();
-        if (!calls.Any(call => hosted.Owns(call.Name))) return false;
+        if (!calls.Any(call => hosted.Owns(call.Name))) return null;
         if (round >= MaximumToolRounds || calls.Length != 1 || calls[0].Namespace is not null || string.IsNullOrEmpty(calls[0].CallId)
             || options?.ToolMode is NoneChatToolMode
             || options?.ToolMode is RequiredChatToolMode { RequiredFunctionName: { } name } && calls[0].Name != name)
             throw new InvalidOperationException("The gateway returned an unexpected hosted tool call.");
-        var call = calls[0];
+        return calls[0];
+    }
+
+    private async Task InvokeHostedAsync(ResponseResult result, ResponseFunctionCallItem call, List<ResponseInputItem> input,
+        Func<HostedToolActivity, Task>? observe, CancellationToken ct)
+    {
         using var arguments = JsonDocument.Parse(call.Arguments);
-        if (await hosted.InvokeAsync(call.Name, call.CallId, arguments.RootElement, ct) is not McpCallOutcome.Completed completed)
+        var outcome = observe is null
+            ? await hosted!.InvokeAsync(call.Name, call.CallId, arguments.RootElement, ct)
+            : await hosted!.InvokeAsync(call.Name, call.CallId, arguments.RootElement, observe, ct);
+        if (outcome is not McpCallOutcome.Completed completed)
             throw new AgentRequestException("This MCP call requires approval before execution and was not dispatched.", "mcp_approval_required");
         if (GetText(result) is { Length: > 0 } text)
             input.Add(new ResponseInputMessage { Role = ResponseRole.Assistant, Content = new ResponseMessageContent([new OutputTextPart(text)]) });
@@ -119,7 +168,47 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
         input.Add(new ResponseFunctionCallOutputItem { CallId = call.CallId, Output = completed.Output.GetRawText() });
         if (input.RemoveAll(item => item is ResponseMcpApprovalResponseItem) > 0)
             input.AddRange(result.OutputItems.OfType<ResponseMcpCallItem>());
-        return true;
+    }
+
+    private async IAsyncEnumerable<HostedToolActivity> InvokeWithActivityAsync(ResponseResult result, ResponseFunctionCallItem call,
+        List<ResponseInputItem> input, [EnumeratorCancellation] CancellationToken ct)
+    {
+        // One invocation, at most two frames. Cancel and join it if enumeration stops early.
+        var queue = Channel.CreateUnbounded<HostedToolActivity>(new() { SingleReader = true, SingleWriter = true });
+        using var invocation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        async Task ExecuteAsync()
+        {
+            try
+            {
+                await InvokeHostedAsync(result, call, input,
+                    activity => queue.Writer.WriteAsync(activity with { Input = activity.Input.Clone() }, invocation.Token).AsTask(), invocation.Token);
+                queue.Writer.Complete();
+            }
+            catch (Exception error) { queue.Writer.TryComplete(error); }
+        }
+        var execution = ExecuteAsync();
+        try
+        {
+            await foreach (var activity in queue.Reader.ReadAllAsync(ct)) yield return activity;
+        }
+        finally
+        {
+            await invocation.CancelAsync();
+            await execution;
+        }
+    }
+
+    private static ChatResponseUpdate ActivityUpdate(HostedToolActivity activity) => new()
+    {
+        Role = ChatRole.Assistant, Contents = [new HostedToolActivityContent(activity)]
+    };
+
+    private static HostedToolActivity? ReadGatewayActivity(ResponseStreamPart part)
+    {
+        if (part is not ResponseUnknownEvent { Type: HostedToolActivity.ResponsesEvent } evt
+            || evt.Data?.GetValueOrDefault("activity") is not { ValueKind: JsonValueKind.Object } data) return null;
+        var activity = data.Deserialize<HostedToolActivity>(JsonSerializerOptions.Web);
+        return activity is { CallId.Length: > 0, Name.Length: > 0, Input.ValueKind: not JsonValueKind.Undefined } ? activity : null;
     }
 
     private void AddUsage(ResponseResult result, ref UsageDetails? total)
