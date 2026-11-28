@@ -106,7 +106,7 @@ public sealed class AgentSkillTests
             2 => ToolCall(call, step, "activate_skill", new { skill_id = RemoteId }),
             3 => ToolCall(call, step, "read_skill_resource", new { skill_id = RemoteId, path = "references/notes.md" }),
             4 => ToolCall(call, step, "read_skill_resource", new { skill_id = "planning", path = "assets/fixture.bin" }),
-            _ => GatewayFixture.Text(call, "Skill run complete")
+            _ => GatewayFixture.ReplyResult(call, GatewayFixture.Completed.Replace("Hello there", "Skill run complete").ReplaceLineEndings(""))
         };
 
         using var request = Request(endpoint, stream, [inline, new { type = "skill_reference", skill_id = RemoteId, version }]);
@@ -118,6 +118,10 @@ public sealed class AgentSkillTests
         Assert.True(result.IsSuccessStatusCode, responseText);
         Assert.Contains("Skill run complete", responseText);
         Assert.DoesNotContain("tool-approval-request", responseText);
+        var chat = endpoint == Chat;
+        var terminal = AgentAccountingTests.Terminal(responseText, chat, stream);
+        Assert.Equal(19, (int?)terminal["usage"]![chat ? "totalTokens" : "total_tokens"]);
+        Assert.Equal(0.004m, (decimal?)terminal[chat ? "providerMetadata" : "metadata"]!["gateway"]!["cost"]);
         var activity = ToolFrames(responseText);
         if (endpoint == Chat)
         {
@@ -268,8 +272,14 @@ public sealed class AgentSkillTests
         return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
     }
 
-    private static HttpResponseMessage ToolCall(GatewayCall call, int id, string name, object args) => GatewayFixture.Complete(call,
-        [new { type = "function_call", call_id = $"call_{id}", name, arguments = JsonSerializer.Serialize(args) }]);
+    private static HttpResponseMessage ToolCall(GatewayCall call, int id, string name, object args) => GatewayFixture.ReplyResult(call,
+        JsonSerializer.Serialize(new
+        {
+            status = "completed", id = $"resp_{id}",
+            output = new[] { new { type = "function_call", call_id = $"call_{id}", name, arguments = JsonSerializer.Serialize(args) } },
+            usage = new { input_tokens = 2, output_tokens = 1, total_tokens = 3 },
+            metadata = new { gateway = new { cost = 0.001m } }
+        }));
 
     private static JsonElement[] ToolFrames(string wire) => wire.Split('\n')
         .Where(line => line.StartsWith("data: {", StringComparison.Ordinal))

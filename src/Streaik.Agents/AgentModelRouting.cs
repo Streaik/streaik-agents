@@ -60,7 +60,8 @@ public sealed partial class AgentRuntime
     }
 
     internal async Task<IReadOnlyList<AgentRunTarget>> ResolveTargetsAsync(IReadOnlyList<Agent> agents, IReadOnlyList<ChatMessage> messages,
-        Func<Agent, AgentModel, bool, ValueTask<IReadOnlyDictionary<string, string>?>> headersFor, CancellationToken ct)
+        Func<Agent, AgentModel, bool, ValueTask<IReadOnlyDictionary<string, string>?>> headersFor, CancellationToken ct,
+        AgentRunAccounting? accounting = null)
     {
         ct.ThrowIfCancellationRequested();
         var plans = agents.Select(agent => (Agent: agent, Models: ConfiguredModels(agent))).ToArray();
@@ -94,7 +95,7 @@ public sealed partial class AgentRuntime
                 ?? throw new AgentRequestException("The agent does not have an eligible answer model.", "answer_model_required");
 
             if (router is not null && candidates.Length > 1 && await headersFor(agent, router, true) is { } routerHeaders)
-                answer = await SelectModelAsync(agent, router, candidates, catalog, messages, ModelHeaders(router, routerHeaders), ct) ?? answer;
+                answer = await SelectModelAsync(agent, router, candidates, catalog, messages, ModelHeaders(router, routerHeaders), ct, accounting) ?? answer;
 
             var headers = await headersFor(agent, answer, false) ?? EmptyHeaders;
             var tools = AgentHostedTools.Read(agent);
@@ -135,7 +136,8 @@ public sealed partial class AgentRuntime
     }
 
     private async Task<AgentModel?> SelectModelAsync(Agent agent, AgentModel router, AgentModel[] candidates,
-        Dictionary<string, JsonElement> catalog, IReadOnlyList<ChatMessage> messages, IReadOnlyDictionary<string, string> headers, CancellationToken ct)
+        Dictionary<string, JsonElement> catalog, IReadOnlyList<ChatMessage> messages, IReadOnlyDictionary<string, string> headers,
+        CancellationToken ct, AgentRunAccounting? accounting)
     {
         try
         {
@@ -171,6 +173,7 @@ public sealed partial class AgentRuntime
             using var response = await gateway.SendAsync(request, ct);
             response.EnsureSuccessStatusCode();
             var decision = await response.Content.ReadFromJsonAsync<DecisionResponse>(ct);
+            if (decision is not null) accounting?.ObserveDecision(decision);
             return decision?.Answers is { Count: 1 } answers && answers.TryGetValue("model", out var answer)
                 && answer is DecisionChoiceAnswer { Choice: { } choice } ? candidates.FirstOrDefault(model => model.Id == choice) : null;
         }

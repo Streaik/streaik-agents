@@ -63,6 +63,12 @@ public sealed class WorkflowTests
     public async Task Concurrent_isolates_mixed_provider_credentials(bool stream)
     {
         await using var host = await TestAgentHost.StartAsync();
+        host.Gateway.Respond = call =>
+        {
+            var completed = JsonNode.Parse(GatewayFixture.Completed)!;
+            completed["metadata"] = JsonNode.Parse("""{"gateway":{"cost":0.05}}""");
+            return GatewayFixture.ReplyResult(call, completed.ToJsonString());
+        };
         var body = new
         {
             models = new[] { "GreetingAgent" }, agent = new { name = "Other", model = new { id = "anthropic/test" } },
@@ -88,6 +94,8 @@ public sealed class WorkflowTests
         });
         var completed = stream ? SseEvents(result).Single(item => item["type"]?.GetValue<string>() == "response.completed")["response"] : JsonNode.Parse(result);
         Assert.Equal(14, completed!["usage"]!["total_tokens"]!.GetValue<int>());
+        Assert.Equal(0.10m, (decimal?)completed["metadata"]!["gateway"]!["cost"]);
+        Assert.Null(completed["metadata"]!["gateway"]!["tps"]); // A concurrent workflow releases one aggregated delta.
     }
 
     [Fact]

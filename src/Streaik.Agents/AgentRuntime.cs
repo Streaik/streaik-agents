@@ -62,28 +62,29 @@ public sealed partial class AgentRuntime(HttpClient gateway, HostedToolAccess? h
     }
 
     internal async Task<AgentResponse> RunResolvedAsync(AgentRunTarget target, IEnumerable<ChatMessage> messages, ChatOptions? options,
-        CancellationToken cancellationToken, AgentMcpApprovals? approvals = null)
+        CancellationToken cancellationToken, AgentMcpApprovals? approvals = null, AgentRunAccounting? accounting = null)
     {
         await using var turn = await OpenToolsAsync(target, cancellationToken);
-        return await CreateAgent(target, turn, approvals: approvals).RunAsync(messages,
+        return await CreateAgent(target, turn, accounting: accounting, approvals: approvals).RunAsync(messages,
             options: options is null ? null : new ChatClientAgentRunOptions(options), cancellationToken: cancellationToken);
     }
 
     internal async IAsyncEnumerable<AgentResponseUpdate> StreamResolvedAsync(AgentRunTarget target, IEnumerable<ChatMessage> messages, ChatOptions? options,
-        [EnumeratorCancellation] CancellationToken cancellationToken, AgentMcpApprovals? approvals = null, bool reportHostedActivity = false)
+        [EnumeratorCancellation] CancellationToken cancellationToken, AgentMcpApprovals? approvals = null, bool reportHostedActivity = false,
+        AgentRunAccounting? accounting = null)
     {
         await using var turn = await OpenToolsAsync(target, cancellationToken);
-        await foreach (var update in CreateAgent(target, turn, approvals: approvals, reportHostedActivity: reportHostedActivity).RunStreamingAsync(messages,
+        await foreach (var update in CreateAgent(target, turn, accounting: accounting, approvals: approvals, reportHostedActivity: reportHostedActivity).RunStreamingAsync(messages,
             options: options is null ? null : new ChatClientAgentRunOptions(options), cancellationToken: cancellationToken)) yield return update;
     }
 
-    private ChatClientAgent CreateAgent(AgentRunTarget target, HostedToolTurn? turn, ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null,
+    private ChatClientAgent CreateAgent(AgentRunTarget target, HostedToolTurn? turn, ChatOptions? defaults = null, AgentRunAccounting? accounting = null,
         AgentMcpApprovals? approvals = null, bool reportHostedActivity = false)
     {
         var definition = target.Definition;
         IChatClient client = GetTransport(definition) switch
         {
-            Agent.DefaultTransport => new ResponsesChatClient(gateway, target.Model, target.Headers, defaults, observeUsage,
+            Agent.DefaultTransport => new ResponsesChatClient(gateway, target.Model, target.Headers, defaults, accounting,
                 turn, target.Tools.Server, target.Tools.NativeMcp, approvals, reportHostedActivity),
             _ => throw new InvalidOperationException("Agent transport was not registered.")
         };

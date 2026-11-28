@@ -37,7 +37,7 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
     public GatewayFixture Gateway { get; } = gateway;
 
     public static async Task<TestAgentHost> StartAsync(bool azure = false, IAgentSource? extraSource = null, HostedToolAccess? mcp = null,
-        string? signingSecret = "test-agent-tool-signing-key")
+        string? signingSecret = "test-agent-tool-signing-key", TimeProvider? clock = null)
     {
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
@@ -55,6 +55,7 @@ internal sealed class TestAgentHost(WebApplication app, HttpClient client, Gatew
 
         var fixture = new GatewayFixture();
         builder.Services.AddStreaikAgents(builder.Configuration.GetSection("StreaikAgents"));
+        if (clock is not null) builder.Services.AddSingleton(clock);
         if (mcp is not null) builder.Services.AddSingleton(mcp);
         builder.Services.AddHttpClient(AgentHosting.GatewayClientName).ConfigurePrimaryHttpMessageHandler(() => fixture);
         if (azure)
@@ -173,10 +174,12 @@ internal sealed class GatewayFixture : HttpMessageHandler
     public static HttpResponseMessage Complete(GatewayCall call, object[] output)
     {
         var result = JsonSerializer.Serialize(new { id = $"resp_{Guid.NewGuid():N}", status = "completed", output });
-        return call.Body.GetProperty("stream").GetBoolean()
-            ? Reply($"data: {{\"type\":\"response.completed\",\"response\":{result}}}\n\ndata: [DONE]\n\n", stream: true)
-            : Reply(result);
+        return ReplyResult(call, result);
     }
+
+    public static HttpResponseMessage ReplyResult(GatewayCall call, string result, string prefix = "") => call.Body.GetProperty("stream").GetBoolean()
+        ? Reply($"{prefix}data: {{\"type\":\"response.completed\",\"response\":{result}}}\n\ndata: [DONE]\n\n", stream: true)
+        : Reply(result);
 
     public static HttpResponseMessage Text(GatewayCall call, string text) => Complete(call,
         [new { id = "msg_fixture", type = "message", role = "assistant", content = new[] { new { type = "output_text", text } } }]);

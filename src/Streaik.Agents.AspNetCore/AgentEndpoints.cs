@@ -5,7 +5,6 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.AI;
 using Streaik.Responses;
 
 namespace Streaik.Agents.AspNetCore;
@@ -61,6 +60,9 @@ public static class AgentEndpoints
         AgentOutput? output = null;
         try
         {
+            var accounting = new AgentRunAccounting();
+            var clock = context.RequestServices.GetService<TimeProvider>() ?? TimeProvider.System;
+            long? started = input.Stream ? clock.GetTimestamp() : null;
             var credentials = context.RequestServices.GetService<IAgentGatewayHeaders>();
             var participants = input.Agents;
             var router = participants.Count > 1 ? input.Workflow.Router : null;
@@ -85,33 +87,30 @@ public static class AgentEndpoints
 
             if (router is not null)
                 participants = [await runtime.SelectAgentAsync(router, participants, input.Messages,
-                    runtime.ModelHeaders(router.Model!, (await HeadersFor(router, router.Model!, false))!), ct)];
+                    runtime.ModelHeaders(router.Model!, (await HeadersFor(router, router.Model!, false))!), ct, accounting)];
             // Resolve only the chosen agents, once per workflow run, before running answer inference.
-            var targets = await runtime.ResolveTargetsAsync(participants, input.Messages, HeadersFor, ct);
+            var targets = await runtime.ResolveTargetsAsync(participants, input.Messages, HeadersFor, ct, accounting);
 
             var primary = targets[0];
-            output = new AgentOutput(context.Response, participants.Count == 1 ? primary.Definition.Name! : input.Workflow.Type, ui, ct, input.Browser?.Signer);
+            output = new AgentOutput(context.Response, participants.Count == 1 ? primary.Definition.Name! : input.Workflow.Type,
+                ui, ct, accounting, clock, started, input.Browser?.Signer);
             if (!input.Stream && participants.Count == 1)
             {
-                var result = await runtime.RunResolvedAsync(primary, input.Messages, input.Options, ct, input.Mcp);
+                var result = await runtime.RunResolvedAsync(primary, input.Messages, input.Options, ct, input.Mcp, accounting);
                 var items = result.Messages.SelectMany(message => message.Contents.OfType<NativeResponseContent>()).Select(content => content.Item);
-                await context.Response.WriteAsJsonAsync(output.Snapshot("completed", result.Text, result.Usage, nativeItems: items), ResponseJson.Default, ct);
+                await context.Response.WriteAsJsonAsync(output.Snapshot("completed", result.Text, nativeItems: items), ResponseJson.Default, ct);
                 return;
             }
 
             var updates = participants.Count == 1
-                ? runtime.StreamResolvedAsync(primary, input.Messages, input.Options, ct, input.Mcp, reportHostedActivity: ui)
-                : runtime.RunWorkflowAsync(input.Workflow, targets, input.Messages.ToList(), input.Options, input.Stream, ct, reportHostedActivity: ui);
+                ? runtime.StreamResolvedAsync(primary, input.Messages, input.Options, ct, input.Mcp, reportHostedActivity: ui, accounting: accounting)
+                : runtime.RunWorkflowAsync(input.Workflow, targets, input.Messages.ToList(), input.Options, input.Stream, ct, accounting, reportHostedActivity: ui);
             if (!input.Stream)
             {
                 var text = new StringBuilder();
-                UsageDetails? usage = null;
                 await foreach (var update in updates.WithCancellation(ct))
-                {
                     text.Append(update.Text);
-                    usage = update.Contents.OfType<UsageContent>().LastOrDefault()?.Details ?? usage;
-                }
-                await context.Response.WriteAsJsonAsync(output.Snapshot("completed", text.ToString(), usage), ResponseJson.Default, ct);
+                await context.Response.WriteAsJsonAsync(output.Snapshot("completed", text.ToString()), ResponseJson.Default, ct);
                 return;
             }
 

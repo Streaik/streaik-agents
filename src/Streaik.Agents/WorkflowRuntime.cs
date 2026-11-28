@@ -12,7 +12,7 @@ namespace Streaik.Agents;
 public sealed partial class AgentRuntime
 {
     internal async Task<Agent> SelectAgentAsync(Agent router, IReadOnlyList<Agent> candidates,
-        IReadOnlyList<ChatMessage> messages, IReadOnlyDictionary<string, string>? headers, CancellationToken ct)
+        IReadOnlyList<ChatMessage> messages, IReadOnlyDictionary<string, string>? headers, CancellationToken ct, AgentRunAccounting accounting)
     {
         var choices = candidates.Select((agent, i) => (Id: $"agent-{i}", Agent: agent))
             .ToDictionary(choice => choice.Id, choice => choice.Agent, StringComparer.Ordinal);
@@ -45,6 +45,7 @@ public sealed partial class AgentRuntime
         using var response = await gateway.SendAsync(request, ct);
         response.EnsureSuccessStatusCode();
         var result = await response.Content.ReadFromJsonAsync<DecisionResponse>(ct);
+        if (result is not null) accounting.ObserveDecision(result);
         if (result?.Answers is { Count: 1 } answers && answers.TryGetValue("agent", out var answer)
             && answer is DecisionChoiceAnswer { Choice: { } choice } && choices.TryGetValue(choice, out var agent))
             return agent;
@@ -54,17 +55,15 @@ public sealed partial class AgentRuntime
 
     internal async IAsyncEnumerable<AgentResponseUpdate> RunWorkflowAsync(AgentWorkflow workflow,
         IReadOnlyList<AgentRunTarget> targets, List<ChatMessage> messages, ChatOptions? options, bool stream,
-        [EnumeratorCancellation] CancellationToken ct, bool reportHostedActivity = false)
+        [EnumeratorCancellation] CancellationToken ct, AgentRunAccounting accounting, bool reportHostedActivity = false)
     {
-        var usage = new UsageDetails();
-        var hasUsage = false;
         await using var turns = new WorkflowToolTurns();
         var agents = new List<AIAgent>(targets.Count);
         foreach (var target in targets)
         {
             var turn = await OpenToolsAsync(target, ct);
             if (turn is not null) turns.Items.Add(turn);
-            agents.Add(CreateAgent(target, turn, options, ObserveUsage, reportHostedActivity: reportHostedActivity));
+            agents.Add(CreateAgent(target, turn, options, accounting, reportHostedActivity: reportHostedActivity));
         }
         var graph = BuildWorkflow(workflow, targets.Select(target => target.Definition).ToArray(), agents);
         // Our endpoints expose one text item. Use the aggregated output for concurrent branches
@@ -111,16 +110,6 @@ public sealed partial class AgentRuntime
         if (result is null && !textEmitted)
             throw new InvalidOperationException("The workflow did not produce an output.");
         if (!textEmitted && result is { Length: > 0 }) yield return new AgentResponseUpdate(ChatRole.Assistant, result);
-        if (hasUsage) yield return new AgentResponseUpdate { Contents = [new UsageContent(usage)] };
-
-        void ObserveUsage(UsageDetails details)
-        {
-            lock (usage)
-            {
-                usage.Add(details);
-                hasUsage = true;
-            }
-        }
     }
 
     private sealed class WorkflowToolTurns : IAsyncDisposable

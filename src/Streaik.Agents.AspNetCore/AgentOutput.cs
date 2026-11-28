@@ -12,40 +12,42 @@ using Streaik.Vercel.Security;
 
 namespace Streaik.Agents.AspNetCore;
 
-internal sealed class AgentOutput(HttpResponse response, string name, bool ui, CancellationToken cancellationToken, ToolApprovalSigner? signer = null)
+internal sealed class AgentOutput(HttpResponse response, string name, bool ui, CancellationToken cancellationToken,
+    AgentRunAccounting accounting, TimeProvider clock, long? started, ToolApprovalSigner? signer = null)
 {
     private readonly string _id = $"resp_{Guid.NewGuid():N}";
     private readonly string _messageId = $"msg_{Guid.NewGuid():N}";
     private readonly long _created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
     private readonly StringBuilder _text = new();
-    private UsageDetails? _usage;
+    private long? _firstDelta;
+    private long _lastDelta;
     private readonly HashSet<string> _browserCalls = new(StringComparer.Ordinal);
     private readonly List<ResponseInputItem> _nativeItems = [];
     private bool _review;
     private int _sequence;
 
-    public ResponseResult Snapshot(string status, string? text = null, UsageDetails? usage = null, ResponseResultError? error = null,
-        IEnumerable<ResponseInputItem>? nativeItems = null) => new()
+    public ResponseResult Snapshot(string status, string? text = null, ResponseResultError? error = null,
+        IEnumerable<ResponseInputItem>? nativeItems = null)
     {
-        Id = _id,
-        Model = name,
-        CreatedAt = _created,
-        CompletedAt = status == "completed" ? DateTimeOffset.UtcNow.ToUnixTimeSeconds() : null,
-        Status = status,
-        Store = false,
-        Error = error,
-        Output = [.. (string.IsNullOrEmpty(text) ? Array.Empty<ResponseInputItem>() : new ResponseInputItem[] { new ResponseInputMessage
+        var (usage, cost) = status == "completed" ? accounting.Snapshot() : default;
+        return new()
         {
-            Id = _messageId, Role = ResponseRole.Assistant, Status = status,
-            Content = new ResponseMessageContent([new OutputTextPart(text)])
-        } }), .. (nativeItems ?? _nativeItems)],
-        Usage = usage is null ? null : new ResponseUsage
-        {
-            InputTokens = (int?)usage.InputTokenCount,
-            OutputTokens = (int?)usage.OutputTokenCount,
-            TotalTokens = (int?)usage.TotalTokenCount
-        }
-    };
+            Id = _id,
+            Model = name,
+            CreatedAt = _created,
+            CompletedAt = status == "completed" ? DateTimeOffset.UtcNow.ToUnixTimeSeconds() : null,
+            Status = status,
+            Store = false,
+            Error = error,
+            Output = [.. (string.IsNullOrEmpty(text) ? Array.Empty<ResponseInputItem>() : new ResponseInputItem[] { new ResponseInputMessage
+            {
+                Id = _messageId, Role = ResponseRole.Assistant, Status = status,
+                Content = new ResponseMessageContent([new OutputTextPart(text)])
+            } }), .. (nativeItems ?? _nativeItems)],
+            Usage = usage,
+            Metadata = status == "completed" && GatewayMetadata(usage, cost) is { } gateway ? new() { ["gateway"] = gateway } : null
+        };
+    }
 
     public async Task StartAsync()
     {
@@ -64,7 +66,6 @@ internal sealed class AgentOutput(HttpResponse response, string name, bool ui, C
     {
         foreach (var part in update.Contents)
         {
-            if (part is UsageContent usage) _usage = usage.Details;
             if (ui && part is HostedToolActivityContent hosted)
                 await EventAsync<UIMessagePart>(hosted.Activity switch
                 {
@@ -100,6 +101,8 @@ internal sealed class AgentOutput(HttpResponse response, string name, bool ui, C
             if (part is not TextContent { Text.Length: > 0 } text) continue;
             if (_text.Length == 0) await StartTextAsync();
             _text.Append(text.Text);
+            _lastDelta = clock.GetTimestamp();
+            _firstDelta ??= _lastDelta;
             if (ui) await EventAsync(new TextDeltaUIMessageStreamPart { Id = _messageId, Delta = text.Text });
             else await EventAsync(new ResponseOutputTextDelta { ItemId = _messageId, SequenceNumber = _sequence++, Delta = text.Text });
         }
@@ -110,7 +113,17 @@ internal sealed class AgentOutput(HttpResponse response, string name, bool ui, C
         if (ui)
         {
             if (_text.Length != 0) await EventAsync(new TextEndUIMessageStreamPart { Id = _messageId });
-            await EventAsync(new { type = "finish", finishReason = _browserCalls.Count == 0 && !_review ? "stop" : "tool-calls" });
+            var (usage, cost) = accounting.Snapshot();
+            await EventAsync(new FinishUIPart
+            {
+                FinishReason = _browserCalls.Count == 0 && !_review ? "stop" : "tool-calls",
+                MessageMetadata = new()
+                {
+                    Model = name, Timestamp = DateTimeOffset.UtcNow,
+                    Usage = new() { PromptTokens = usage?.InputTokens, CompletionTokens = usage?.OutputTokens, TotalTokens = usage?.TotalTokens },
+                    ProviderMetadata = GatewayMetadata(usage, cost) is { } gateway ? new() { ["gateway"] = gateway } : null
+                }
+            });
         }
         else
         {
@@ -121,7 +134,7 @@ internal sealed class AgentOutput(HttpResponse response, string name, bool ui, C
                 await EventAsync(new ResponseContentPartDone { ItemId = _messageId, Part = TextPart(text), SequenceNumber = _sequence++ });
                 await EventAsync(new ResponseOutputItemDone { Item = Item("completed", text), SequenceNumber = _sequence++ });
             }
-            await EventAsync(new ResponseCompleted { Response = Snapshot("completed", text, _usage), SequenceNumber = _sequence++ });
+            await EventAsync(new ResponseCompleted { Response = Snapshot("completed", text), SequenceNumber = _sequence++ });
         }
         await SendAsync("data: [DONE]\n\n");
     }
@@ -157,6 +170,20 @@ internal sealed class AgentOutput(HttpResponse response, string name, bool ui, C
     };
 
     private static ResponseStreamContentPart TextPart(string text) => new() { Type = "output_text", Text = text, Annotations = [] };
+
+    private JsonElement? GatewayMetadata(ResponseUsage? usage, decimal? cost)
+    {
+        var gateway = new Dictionary<string, object>();
+        if (cost is { } amount) gateway["cost"] = amount;
+        // Match the gateway: first outgoing content delta, then output tokens over the first-to-last delta interval.
+        if (started is { } start && _firstDelta is { } first)
+        {
+            gateway["ttft"] = clock.GetElapsedTime(start, first).TotalSeconds;
+            var duration = clock.GetElapsedTime(first, _lastDelta).TotalSeconds;
+            if (usage?.OutputTokens is { } tokens && duration > 0) gateway["tps"] = tokens / duration;
+        }
+        return gateway.Count == 0 ? null : JsonSerializer.SerializeToElement(gateway);
+    }
 
     private Task EventAsync<T>(T part)
     {

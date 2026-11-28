@@ -10,7 +10,7 @@ using Streaik.Tools;
 namespace Streaik.Agents;
 
 internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, IReadOnlyDictionary<string, string>? headers,
-    ChatOptions? defaults = null, Action<UsageDetails>? observeUsage = null, HostedToolTurn? hosted = null,
+    ChatOptions? defaults = null, AgentRunAccounting? accounting = null, HostedToolTurn? hosted = null,
     HostedToolDefinition[]? gatewayTools = null, ResponseToolDefinition[]? nativeTools = null, AgentMcpApprovals? approvals = null,
     bool reportHostedActivity = false) : IChatClient
 {
@@ -34,7 +34,7 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             result = await gateway.GetResponses(CreateRequest(input, options, stream: false, continuation), providerId: null,
                 relativeUrl: Agent.DefaultTransport, headers: headers, ct: cancellationToken);
             CheckResult(result);
-            AddUsage(result, ref usage);
+            AccountFor(result, ref usage);
             continuation.Complete(result, approvals?.Execution, model.Id);
             review = ReadApprovals(result);
             if (review.Count > 0 || !await ContinueHostedAsync(result, input, round, options, cancellationToken)) break;
@@ -104,7 +104,7 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             cancellationToken.ThrowIfCancellationRequested();
             if (result is null) throw new InvalidOperationException("The upstream stream closed without a terminal response.");
             CheckResult(result);
-            AddUsage(result, ref usage);
+            AccountFor(result, ref usage);
             if (!hasText && GetText(result) is { Length: > 0 } text) yield return new ChatResponseUpdate(ChatRole.Assistant, text);
             continuation.Complete(result, approvals?.Execution, model.Id);
             foreach (var receipt in continuation.Receipts)
@@ -231,11 +231,10 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
         return activity is { CallId.Length: > 0, Name.Length: > 0, Input.ValueKind: not JsonValueKind.Undefined } ? activity : null;
     }
 
-    private void AddUsage(ResponseResult result, ref UsageDetails? total)
+    private void AccountFor(ResponseResult result, ref UsageDetails? total)
     {
-        if (GetUsage(result) is not { } usage) return;
-        observeUsage?.Invoke(usage);
-        (total ??= new UsageDetails()).Add(usage);
+        accounting?.Observe(result);
+        if (GetUsage(result) is { } usage) (total ??= new UsageDetails()).Add(usage);
     }
 
     private sealed class Continuation
