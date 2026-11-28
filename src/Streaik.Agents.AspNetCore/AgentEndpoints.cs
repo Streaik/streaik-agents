@@ -109,7 +109,7 @@ public static class AgentEndpoints
             var participants = input.Agents;
             var router = saved is null && participants.Count > 1 ? input.Workflow.Router : null;
             var providers = (router is null ? participants : participants.Append(router)).SelectMany(AgentRuntime.PotentialProviders)
-                .Concat(participants.SelectMany(AgentRuntime.SkillProviders));
+                .Concat(participants.SelectMany(AgentRuntime.SkillProviders)).Concat(participants.SelectMany(AgentRuntime.SearchProviders));
             var singleProvider = saved?.SingleProvider ?? providers.Distinct(StringComparer.Ordinal).Take(2).Count() == 1;
             var headerCache = new Dictionary<(Agent, AgentModel), IReadOnlyDictionary<string, string>>();
 

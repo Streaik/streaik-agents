@@ -68,6 +68,16 @@ public sealed partial class AgentRuntime
         .OfType<SkillsToolDefinition>().Where(tool => tool.Allows(ToolCaller.Direct)).SelectMany(tool => tool.Skills)
         .OfType<SkillReference>().Select(reference => SkillRoute(reference).Provider);
 
+    internal static IEnumerable<string> SearchModels(IEnumerable<HostedToolDefinition> tools) => tools.Where(tool => tool.Allows(ToolCaller.Direct))
+        .Select(tool => tool switch { ToolSearchDefinition search => search.Model, ResourceSearchDefinition search => search.Model, _ => null })
+        .OfType<string>().Distinct(StringComparer.Ordinal);
+
+    internal static IEnumerable<string> SearchProviders(Agent agent)
+    {
+        var tools = AgentHostedTools.Read(agent);
+        return SearchModels(tools.Client.Concat(tools.Server)).Select(model => model[..model.IndexOf('/')]);
+    }
+
     private static (string Provider, string Path) SkillRoute(SkillReference reference)
     {
         if (reference.SkillId.Split('/') is not [var provider, var id] || provider.Length == 0
@@ -112,7 +122,8 @@ public sealed partial class AgentRuntime
     {
         if (target.Tools.Client.Length == 0) return null;
         try { return await HostedToolTurn.CreateAsync(target.Tools.Client, ToolCaller.Direct, new(hostedAccess?.AuthorizeMcp,
-            hostedAccess?.ResolveSkill ?? target.ResolveSkill, hostedAccess?.CreateMcpHandler), ct); }
+            hostedAccess?.ResolveSkill ?? target.ResolveSkill, hostedAccess?.CreateMcpHandler), ct,
+            defaultSearchModel: target.Model.Id, resolveSearchModel: (model, token) => ResolveHostedSearchAsync(target, model, token)); }
         catch (UnauthorizedAccessException) { throw new AgentRequestException("This agent is not authorized to use the configured MCP tools.", "agent_tool_not_authorized"); }
         catch (Exception error) when (error is InvalidDataException or JsonException)
         { throw new AgentRequestException("The agent tools include an invalid skill bundle or hosted configuration.", "invalid_agent_skill"); }

@@ -6,7 +6,7 @@ using Streaik.Vercel.Models;
 namespace Streaik.Agents;
 
 internal sealed record AgentRunTarget(Agent Definition, AgentModel Model, IReadOnlyDictionary<string, string> Headers,
-    AgentHostedTools Tools, SkillArchiveResolver ResolveSkill);
+    AgentHostedTools Tools, SkillArchiveResolver ResolveSkill, IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> SearchHeaders);
 
 public sealed partial class AgentRuntime
 {
@@ -121,16 +121,30 @@ public sealed partial class AgentRuntime
     {
         var headers = await headersFor(agent, answer, false) ?? EmptyHeaders;
         var tools = AgentHostedTools.Read(agent);
+        var inferenceHeaders = ModelHeaders(answer, headers);
+        var searchHeaders = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.Ordinal)
+            { [GetProvider(answer)] = inferenceHeaders };
+        foreach (var id in SearchModels(tools.Client.Concat(tools.Server)))
+        {
+            var model = new AgentModel { Id = id };
+            var provider = GetProvider(model);
+            if (!searchHeaders.ContainsKey(provider) && await headersFor(agent, model, true) is { } credentials)
+                searchHeaders[provider] = ModelHeaders(model, credentials);
+        }
+        // Only pass a named key understood by the gateway for its own hosted selectors. Never reuse an inbound bearer across providers.
+        foreach (var provider in SearchModels(tools.Server).Select(id => id[..id.IndexOf('/')]).Distinct(StringComparer.Ordinal))
+            if (provider != GetProvider(answer) && searchHeaders.TryGetValue(provider, out var credential)
+                && credential.TryGetValue($"x-{provider}-key", out var value)) inferenceHeaders[$"x-{provider}-key"] = value;
         var skillHeaders = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.Ordinal) { [GetProvider(answer)] = headers };
         if (hostedAccess?.ResolveSkill is null)
             foreach (var provider in SkillProviders(agent).Distinct(StringComparer.Ordinal))
                 if (!skillHeaders.ContainsKey(provider))
                     skillHeaders[provider] = await headersFor(agent, new AgentModel { Id = $"{provider}/skill" }, false) ?? EmptyHeaders;
-        return new AgentRunTarget(agent, answer, ModelHeaders(answer, headers), tools, (reference, cancellationToken) =>
+        return new AgentRunTarget(agent, answer, inferenceHeaders, tools, (reference, cancellationToken) =>
         {
             var (provider, path) = SkillRoute(reference);
             return DownloadSkillAsync(path, ScopeHeaders(skillHeaders[provider], new(StringComparer.Ordinal) { provider }), cancellationToken);
-        });
+        }, searchHeaders);
     }
 
     private static string? ModelType(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim().ToLowerInvariant();
@@ -217,7 +231,7 @@ public sealed partial class AgentRuntime
     private static bool RoutingFailed(Exception error, CancellationToken ct) => !ct.IsCancellationRequested
         && error is HttpRequestException or JsonException or InvalidOperationException or NotSupportedException or OperationCanceledException;
 
-    internal IReadOnlyDictionary<string, string> ModelHeaders(AgentModel model, IReadOnlyDictionary<string, string> credentials)
+    internal Dictionary<string, string> ModelHeaders(AgentModel model, IReadOnlyDictionary<string, string> credentials)
     {
         var provider = GetProvider(model);
         var headers = ScopeHeaders(credentials, new HashSet<string>(StringComparer.Ordinal) { provider });

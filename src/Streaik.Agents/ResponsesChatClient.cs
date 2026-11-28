@@ -489,7 +489,7 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             throw new InvalidOperationException("The upstream did not complete the response.");
     }
 
-    private static string GetText(ResponseResult result) => result.OutputText ?? string.Concat(result.OutputItems
+    internal static string GetText(ResponseResult result) => result.OutputText ?? string.Concat(result.OutputItems
         .OfType<ResponseInputMessage>().Where(message => message.Role == ResponseRole.Assistant)
         .Select(message => message.Content.Text ?? string.Concat((message.Content.Parts ?? []).OfType<OutputTextPart>().Select(part => part.Text))));
 
