@@ -63,6 +63,78 @@ public sealed class AgentModelRoutingTests
         Assert.All(host.Gateway.Calls, call => Assert.False(call.Headers.ContainsKey("Authorization")));
     }
 
+    [Theory]
+    [InlineData("/v1/responses", false)]
+    [InlineData("/api/chat", true)]
+    public async Task Explicit_router_and_answer_can_share_an_id(string endpoint, bool decisionFirst)
+    {
+        const string router = """{"id":"openai/shared","type":"decision","providerMetadata":{"strategy":"decision-only"}}""";
+        const string answer = """{"id":"openai/shared","type":"language","options":{"temperature":0.25},"providerMetadata":{"service_tier":"flex"}}""";
+        const string alternate = """{"id":"openai/alternate","type":"language"}""";
+        var models = decisionFirst ? new[] { router, answer, alternate } : new[] { answer, router, alternate };
+        await using var host = await TestAgentHost.StartAsync();
+        host.Gateway.Respond = call => call.Endpoint.AbsolutePath switch
+        {
+            "/base/api/decisions" => Decision("openai/shared"),
+            "/base/v1/responses" => GatewayFixture.Text(call, "Answered"),
+            _ => throw new InvalidOperationException("An explicit router and typed answers do not require discovery.")
+        };
+        using var request = RoutedRequest(endpoint, string.Join(',', models));
+        using var response = await host.Client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains("Answered", await response.Content.ReadAsStringAsync());
+        Assert.Collection(host.Gateway.Calls, call =>
+        {
+            Assert.Equal("/base/api/decisions", call.Endpoint.AbsolutePath);
+            Assert.Equal("openai/shared", Model(call));
+            Assert.Equal("decision-only", call.Body.GetProperty("providerOptions").GetProperty("openai").GetProperty("strategy").GetString());
+            Assert.Equal(new[] { "openai/shared", "openai/alternate" }, Criteria(call).EnumerateObject().Select(p => p.Name));
+        }, call =>
+        {
+            Assert.Equal("/base/v1/responses", call.Endpoint.AbsolutePath);
+            Assert.Equal("openai/shared", Model(call));
+            Assert.Equal(0.25, call.Body.GetProperty("temperature").GetDouble());
+            Assert.Equal("flex", call.Body.GetProperty("service_tier").GetString());
+        });
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task Catalog_dual_use_models_keep_both_roles_regardless_of_listing_order(bool typed, bool decisionFirst)
+    {
+        const string answer = """{"id":"openai/shared","type":"language","description":"Answer capabilities"}""";
+        const string decision = """{"id":"openai/shared","type":"decision","description":"Router capabilities"}""";
+        var listing = decisionFirst ? $"{decision},{answer}" : $"{answer},{decision}";
+        await using var host = await TestAgentHost.StartAsync();
+        host.Gateway.Respond = call => call.Endpoint.AbsolutePath switch
+        {
+            "/base/v1/models" => GatewayFixture.Reply($$"""{"data":[{{listing}},{"id":"openai/alternate","type":"language"}]}"""),
+            "/base/api/decisions" => Decision("openai/alternate"),
+            "/base/v1/responses" => GatewayFixture.Text(call, "Answered"),
+            _ => throw new InvalidOperationException("Unexpected gateway call.")
+        };
+        var models = typed ? """{"id":"openai/shared","type":"language"},{"id":"openai/alternate","type":"language"}"""
+            : """{"id":"openai/shared"},{"id":"openai/alternate"}""";
+        using var request = RoutedRequest("/v1/responses", models);
+        using var response = await host.Client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Collection(host.Gateway.Calls, call => Assert.Equal("/base/v1/models", call.Endpoint.AbsolutePath), call =>
+        {
+            Assert.Equal("/base/api/decisions", call.Endpoint.AbsolutePath);
+            Assert.Equal("openai/shared", Model(call));
+            var criteria = Criteria(call);
+            Assert.Equal(new[] { "openai/shared", "openai/alternate" }, criteria.EnumerateObject().Select(p => p.Name));
+            Assert.Equal("Answer capabilities", criteria.GetProperty("openai/shared").GetProperty("description").GetString());
+        }, call =>
+        {
+            Assert.Equal("/base/v1/responses", call.Endpoint.AbsolutePath);
+            Assert.Equal("openai/alternate", Model(call));
+        });
+    }
+
     [Fact]
     public async Task Gateway_catalog_is_shared_within_each_workflow_but_never_across_callers()
     {
@@ -105,7 +177,8 @@ public sealed class AgentModelRoutingTests
     [Theory]
     [InlineData("""[{"id":"openai/answer"},{"id":"openai/answer"}]""")]
     [InlineData("""[{"id":"fireworks/router","type":"decision"},{"id":"openai/answer","type":"language"}]""")]
-    [InlineData("""[{"id":"openai/answer","type":"language"},{"id":"other/untyped"}]""")]
+    [InlineData("""[{"id":"openai/answer","type":"language"},{"id":"other/transcriber","type":"transcription"}]""")]
+    [InlineData("""[{"id":"openai/answer","type":"decision"},{"id":"openai/answer","type":"language"}]""")]
     public async Task A_single_eligible_answer_does_not_need_a_decision_or_list(string models)
     {
         await using var host = await TestAgentHost.StartAsync();
@@ -116,7 +189,17 @@ public sealed class AgentModelRoutingTests
         Assert.Equal("openai/answer", Model(Assert.Single(host.Gateway.Calls)));
     }
 
+    private static HttpRequestMessage RoutedRequest(string endpoint, string models)
+    {
+        var body = endpoint == "/api/chat"
+            ? $$"""{"agent":{"name":"RoutingAgent","models":[{{models}}]},"messages":[{"id":"u1","role":"user","parts":[{"type":"text","text":"Find the answer"}]}]}"""
+            : $$"""{"agent":{"name":"RoutingAgent","models":[{{models}}]},"input":"Find the answer"}""";
+        return TestAgentHost.Post(endpoint, JsonSerializer.Deserialize<JsonElement>(body), "answer-key");
+    }
+
     private static string? Model(GatewayCall call) => call.Body.GetProperty("model").GetString();
+
+    private static JsonElement Criteria(GatewayCall call) => call.Body.GetProperty("questions").GetProperty("model").GetProperty("criteria");
 
     private static IEnumerable<KeyValuePair<string, string>> Keys(GatewayCall call) => call.Headers
         .Where(header => header.Key.StartsWith("x-", StringComparison.OrdinalIgnoreCase) && header.Key.EndsWith("-key", StringComparison.OrdinalIgnoreCase));

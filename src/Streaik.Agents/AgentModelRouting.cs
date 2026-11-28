@@ -14,12 +14,14 @@ public sealed partial class AgentRuntime
     internal static readonly IReadOnlyDictionary<string, string> EmptyHeaders = new Dictionary<string, string>();
 
     private static readonly string[] CandidateFields = ["id", "type", "name", "description", "tags", "context_window", "max_tokens", "pricing", "capabilities"];
+    private static readonly Dictionary<string, Dictionary<string, JsonElement>> EmptyCatalog = new(StringComparer.Ordinal);
 
     private static bool HasId(AgentModel? model) => !string.IsNullOrWhiteSpace(model?.Id);
 
     private static AgentModel[] ConfiguredModels(Agent agent)
     {
-        var models = (agent.Models ?? []).OfType<AgentModel>().Where(HasId).DistinctBy(model => model.Id, StringComparer.Ordinal).ToArray();
+        var models = (agent.Models ?? []).OfType<AgentModel>().Where(HasId)
+            .DistinctBy(model => (model.Id, ModelType(model.Type))).ToArray();
         return models.Length != 0 ? models : HasId(agent.Model) ? [agent.Model!] : [];
     }
 
@@ -31,7 +33,7 @@ public sealed partial class AgentRuntime
                 .Concat(HasId(agent.Model) && ModelType(agent.Model!.Type) is null or "language" ? [agent.Model!] : [])
                 .Select(GetProvider).Distinct(StringComparer.Ordinal);
 
-        var plan = Classify(agent, models, model => ModelType(model.Type));
+        var plan = Classify(agent, models, EmptyCatalog);
         if (plan.Router is not null && plan.Candidates.Length > 1)
             return plan.Candidates.Append(plan.Router).Select(GetProvider).Distinct(StringComparer.Ordinal);
         return plan.Fallback is { } answer ? [GetProvider(answer)] : [];
@@ -39,24 +41,35 @@ public sealed partial class AgentRuntime
 
     private static bool NeedsCatalog(AgentModel[] models)
     {
-        if (models.Length < 2 || !models.Any(model => ModelType(model.Type) is null)) return false;
+        if (models.Length < 2) return false;
+        var possibleAnswers = models.Where(model => ModelType(model.Type) is null or "language").ToArray();
         // Discovery can change the default if the first relevant entry isn't already a known answer.
-        var firstPossibleAnswer = models.First(model => ModelType(model.Type) is null or "language");
-        if (ModelType(firstPossibleAnswer.Type) is null) return true;
-
-        var possibleAnswers = models.Count(model => ModelType(model.Type) is null or "language");
-        // A router needs two answer candidates. A model with a missing type cannot be both.
-        return possibleAnswers >= 3 || possibleAnswers >= 2 && models.Any(model => ModelType(model.Type) == "decision");
+        if (possibleAnswers.FirstOrDefault() is { } first && ModelType(first.Type) is null) return true;
+        if (possibleAnswers.Select(model => model.Id).Distinct(StringComparer.Ordinal).Take(2).Count() < 2) return false;
+        // Even a fully typed answer list can include a model also advertised as Decision.
+        return !models.Any(model => ModelType(model.Type) == "decision") || possibleAnswers.Any(model => ModelType(model.Type) is null);
     }
 
     private static (AgentModel? Router, AgentModel[] Candidates, AgentModel? Fallback) Classify(
-        Agent agent, AgentModel[] models, Func<AgentModel, string?> typeOf)
+        Agent agent, AgentModel[] models, IReadOnlyDictionary<string, Dictionary<string, JsonElement>> catalog)
     {
-        var candidates = models.Where(model => typeOf(model) == "language").ToArray();
-        var router = models.FirstOrDefault(model => typeOf(model) == "decision");
+        string? AnswerType(AgentModel model)
+        {
+            var configured = ModelType(model.Type);
+            if (configured is not null || !catalog.TryGetValue(model.Id!, out var variants)) return configured;
+            if (variants.ContainsKey("language")) return "language";
+            return variants.Keys.Any(type => type.Length != 0) ? "other" : null;
+        }
+
+        var candidates = models.Where(model => AnswerType(model) == "language")
+            .GroupBy(model => model.Id, StringComparer.Ordinal)
+            .Select(group => group.FirstOrDefault(model => ModelType(model.Type) == "language") ?? group.First()).ToArray();
+        var router = models.FirstOrDefault(model => ModelType(model.Type) == "decision")
+            ?? models.FirstOrDefault(model => (ModelType(model.Type) is null or "language")
+                && catalog.TryGetValue(model.Id!, out var variants) && variants.ContainsKey("decision"));
         var legacy = HasId(agent.Model) && !models.Any(model => model.Id == agent.Model!.Id)
-            && typeOf(agent.Model!) is null or "language" ? agent.Model : null;
-        return (router, candidates, candidates.FirstOrDefault() ?? models.FirstOrDefault(model => typeOf(model) is null) ?? legacy);
+            && AnswerType(agent.Model!) is null or "language" ? agent.Model : null;
+        return (router, candidates, candidates.FirstOrDefault() ?? models.FirstOrDefault(model => AnswerType(model) is null) ?? legacy);
     }
 
     internal async Task<IReadOnlyList<AgentRunTarget>> ResolveTargetsAsync(IReadOnlyList<Agent> agents, IReadOnlyList<ChatMessage> messages,
@@ -64,15 +77,19 @@ public sealed partial class AgentRuntime
         AgentRunAccounting? accounting = null)
     {
         ct.ThrowIfCancellationRequested();
-        var plans = agents.Select(agent => (Agent: agent, Models: ConfiguredModels(agent))).ToArray();
-        var lookup = plans.Where(plan => NeedsCatalog(plan.Models)).ToArray();
-        var catalog = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        var plans = agents.Select(agent =>
+        {
+            var models = ConfiguredModels(agent);
+            return (Agent: agent, Models: models, Discover: NeedsCatalog(models));
+        }).ToArray();
+        var lookup = plans.Where(plan => plan.Discover).ToArray();
+        var catalog = EmptyCatalog;
         if (lookup.Length != 0)
         {
             // A gateway catalog may be filtered by caller credentials. Share only within this run.
             var discoveryHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var discoveryProviders = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var (agent, models) in lookup)
+            foreach (var (agent, models, _) in lookup)
                 foreach (var model in models.Where(model => ModelType(model.Type) is null or "language" or "decision").DistinctBy(GetProvider))
                 {
                     var provider = GetProvider(model);
@@ -85,12 +102,9 @@ public sealed partial class AgentRuntime
         }
 
         var targets = new List<AgentRunTarget>(agents.Count);
-        foreach (var (agent, models) in plans)
+        foreach (var (agent, models, discover) in plans)
         {
-            // Explicit configuration avoids discovery; a catalog fills missing types, not saved options.
-            string? TypeOf(AgentModel model) => ModelType(model.Type) ?? (models.Length > 1 && catalog.TryGetValue(model.Id!, out var item)
-                && item.TryGetProperty("type", out var type) && type.ValueKind == JsonValueKind.String ? ModelType(type.GetString()) : null);
-            var (router, candidates, fallback) = Classify(agent, models, TypeOf);
+            var (router, candidates, fallback) = Classify(agent, models, discover ? catalog : EmptyCatalog);
             var answer = fallback
                 ?? throw new AgentRequestException("The agent does not have an eligible answer model.", "answer_model_required");
 
@@ -116,7 +130,7 @@ public sealed partial class AgentRuntime
 
     private static string? ModelType(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim().ToLowerInvariant();
 
-    private async Task<Dictionary<string, JsonElement>> ListProviderModelsAsync(IReadOnlyDictionary<string, string> headers, CancellationToken ct)
+    private async Task<Dictionary<string, Dictionary<string, JsonElement>>> ListProviderModelsAsync(IReadOnlyDictionary<string, string> headers, CancellationToken ct)
     {
         try
         {
@@ -125,18 +139,23 @@ public sealed partial class AgentRuntime
             using var response = await gateway.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
             response.EnsureSuccessStatusCode();
             using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
-            var catalog = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+            var catalog = new Dictionary<string, Dictionary<string, JsonElement>>(StringComparer.Ordinal);
             if (document.RootElement.ValueKind == JsonValueKind.Object && document.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
                 foreach (var item in data.EnumerateArray())
                     if (item.ValueKind == JsonValueKind.Object && item.TryGetProperty("id", out var id) && id.ValueKind == JsonValueKind.String)
-                        catalog.TryAdd(id.GetString()!, item.Clone());
+                    {
+                        var modelId = id.GetString()!;
+                        if (!catalog.TryGetValue(modelId, out var variants)) catalog.Add(modelId, variants = new(StringComparer.Ordinal));
+                        var type = item.TryGetProperty("type", out var value) && value.ValueKind == JsonValueKind.String ? ModelType(value.GetString()) : null;
+                        variants.TryAdd(type ?? string.Empty, item.Clone());
+                    }
             return catalog;
         }
-        catch (Exception error) when (RoutingFailed(error, ct)) { return new(StringComparer.Ordinal); }
+        catch (Exception error) when (RoutingFailed(error, ct)) { return EmptyCatalog; }
     }
 
     private async Task<AgentModel?> SelectModelAsync(Agent agent, AgentModel router, AgentModel[] candidates,
-        Dictionary<string, JsonElement> catalog, IReadOnlyList<ChatMessage> messages, IReadOnlyDictionary<string, string> headers,
+        IReadOnlyDictionary<string, Dictionary<string, JsonElement>> catalog, IReadOnlyList<ChatMessage> messages, IReadOnlyDictionary<string, string> headers,
         CancellationToken ct, AgentRunAccounting? accounting)
     {
         try
@@ -181,7 +200,7 @@ public sealed partial class AgentRuntime
 
         JsonElement CandidateEvidence(AgentModel model)
         {
-            var fields = catalog.TryGetValue(model.Id!, out var item) ? item.EnumerateObject()
+            var fields = catalog.TryGetValue(model.Id!, out var variants) && variants.TryGetValue("language", out var item) ? item.EnumerateObject()
                 .Where(property => CandidateFields.Contains(property.Name)).GroupBy(property => property.Name)
                 .ToDictionary(group => group.Key, group => group.First().Value) : new Dictionary<string, JsonElement>();
             fields["id"] = JsonSerializer.SerializeToElement(model.Id);
