@@ -18,7 +18,8 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
     private static readonly HashSet<string> ProtectedFields = new(StringComparer.OrdinalIgnoreCase)
     {
         "model", "input", "instructions", "stream", "store", "background", "previous_response_id", "previousResponseId", "conversation",
-        "tools", "tool_choice", "toolChoice", "parallel_tool_calls", "multi_agent", "multiAgent", "mcp_servers", "mcpServers", "headers"
+        "tools", "tool_choice", "toolChoice", "multiAgent", "mcp_servers", "mcpServers", "headers",
+        AgentExecutionApproval.ProofsKey, AgentExecutionApproval.HistoryKey
     };
 
     public async Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
@@ -332,29 +333,40 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
     private ResponseRequest CreateRequest(IEnumerable<ResponseInputItem> input, ChatOptions? options, bool stream, Continuation continuation)
     {
         var enableTools = options?.ToolMode is not NoneChatToolMode;
-        var functions = options?.Tools?.OfType<AIFunctionDeclaration>().Select(FunctionTool).ToList();
+        var tools = enableTools ? options?.Tools?.OfType<AIFunctionDeclaration>().Select(FunctionTool).ToList() : null;
         if (enableTools && hosted is not null)
         {
             foreach (var tool in hosted.Functions())
             {
                 if (options?.Tools?.OfType<AIFunctionDeclaration>().Any(f => f.Name == tool.Name) == true)
                     throw new AgentRequestException("A function name collides with an agent-hosted tool.", "invalid_agent_tool");
-                (functions ??= []).Add(FunctionTool(tool.Name, tool.Description, tool.InputSchema));
+                (tools ??= []).Add(FunctionTool(tool.Name, tool.Description, tool.InputSchema));
             }
         }
         if (enableTools && gatewayTools is { Length: > 0 })
         {
-            functions ??= [];
+            tools ??= [];
             foreach (var tool in gatewayTools)
             {
                 var descriptor = JsonSerializer.SerializeToElement<HostedToolDefinition>(tool, HostedToolsJson.Options);
                 var type = descriptor.GetProperty("type").GetString()!;
-                functions.Add(new ResponseToolDefinition { Type = type, Extra = descriptor.EnumerateObject()
+                tools.Add(new ResponseToolDefinition { Type = type, Extra = descriptor.EnumerateObject()
                     .Where(field => field.Name != "type").ToDictionary(field => field.Name, field => field.Value, StringComparer.Ordinal) });
-                functions[^1].Extra!["name"] = JsonSerializer.SerializeToElement(type);
+                tools[^1].Extra!["name"] = JsonSerializer.SerializeToElement(type);
             }
         }
-        if (enableTools && nativeTools is { Length: > 0 }) (functions ??= []).AddRange(nativeTools);
+        if (enableTools && nativeTools is { Length: > 0 }) (tools ??= []).AddRange(nativeTools);
+        if (enableTools && model.ProviderMetadata?.GetValueOrDefault("tools") is { ValueKind: JsonValueKind.Array } configuredTools)
+        {
+            foreach (var tool in configuredTools.Deserialize<List<ResponseToolDefinition?>>(ResponseJson.Default)!)
+            {
+                // Callbacks, MCP approvals, and named gateway tools must use the runtime's registration paths.
+                if (tool?.Type is not { Length: > 0 } type || type is "mcp" or "function" or "namespace") continue;
+                if (HostedToolsJson.IsHostedKind(type) && tool.Extra?.GetValueOrDefault("name") is { ValueKind: JsonValueKind.String } name
+                    && name.ValueEquals(type)) continue;
+                (tools ??= []).Add(tool);
+            }
+        }
         var request = new ResponseRequest
         {
             Model = model.Id,
@@ -364,7 +376,7 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             Temperature = options?.Temperature ?? defaults?.Temperature ?? model.Options?.Temperature,
             TopP = options?.TopP ?? defaults?.TopP,
             MaxOutputTokens = options?.MaxOutputTokens ?? defaults?.MaxOutputTokens,
-            Tools = functions,
+            Tools = tools,
             ParallelToolCalls = enableTools && (hosted is not null || gatewayTools is { Length: > 0 }) ? false : null,
             ToolChoice = options?.ToolMode switch
             {
@@ -391,11 +403,16 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             (request.AdditionalProperties ??= [])[AgentExecutionApproval.HistoryKey] = JsonSerializer.SerializeToElement(continuation.History, ResponseJson.Default);
         if (model.ProviderMetadata is not { Count: > 0 } metadata) return request;
 
-        // AIHappey stores native Responses options. Deserialize the merged object so known fields
-        // remain typed, while unknown provider options remain extension data. Runtime values win.
+        // Configured options are native request fields, not application metadata. Deserialize the merged
+        // object so known fields remain typed and unknown ones become root extension data. Runtime values win.
         var fields = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
         foreach (var (name, value) in metadata)
             if (!ProtectedFields.Contains(name)) fields[name] = value;
+        if (!enableTools)
+        {
+            fields.Remove("parallel_tool_calls");
+            fields.Remove("multi_agent");
+        }
         foreach (var property in JsonSerializer.SerializeToElement(request, ResponseJson.Default).EnumerateObject())
         {
             fields.Remove(property.Name);
