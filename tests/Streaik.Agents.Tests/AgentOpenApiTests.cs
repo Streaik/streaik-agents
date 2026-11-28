@@ -14,7 +14,7 @@ public sealed class AgentOpenApiTests
         var family = (await host.Client.GetFromJsonAsync<JsonNode>("/openapi/v1.json"))!;
         var capability = (await host.Client.GetFromJsonAsync<JsonNode>("/openapi/capabilities.json"))!;
 
-        Assert.Equal(new[] { "OpenAI", "Vercel" }, family["tags"]!.AsArray()
+        Assert.Equal(new[] { "Anthropic", "OpenAI", "Vercel" }, family["tags"]!.AsArray()
             .Select(tag => tag!["name"]!.GetValue<string>()).Order(StringComparer.Ordinal));
         Assert.Null(family["x-tagGroups"]);
 
@@ -32,6 +32,8 @@ public sealed class AgentOpenApiTests
         (string Path, string Method, string FamilyTag, string CapabilityTag)[] operations =
         [
             ("/v1/responses", "post", "OpenAI", "Chat /v1"),
+            ("/v1/chat/completions", "post", "OpenAI", "Chat /v1"),
+            ("/v1/messages", "post", "Anthropic", "Chat /v1"),
             ("/api/chat", "post", "Vercel", "Chat /api"),
             ("/v1/models", "get", "OpenAI", "LLM /v1"),
             ("/v1/models/{modelId}", "get", "OpenAI", "LLM /v1")
@@ -69,6 +71,19 @@ public sealed class AgentOpenApiTests
         Assert.NotNull(responses["responses"]!["200"]!["content"]!["application/json"]);
         Assert.NotNull(responses["responses"]!["200"]!["content"]!["text/event-stream"]);
         Assert.NotNull(document["components"]!["securitySchemes"]!["providerBearer"]);
+        foreach (var (path, requiresMaxTokens) in new[] { ("/v1/chat/completions", false), ("/v1/messages", true) })
+        {
+            var operation = document["paths"]![path]!["post"]!;
+            var request = operation["requestBody"]!["content"]!["application/json"]!;
+            var examples = request["examples"]!.AsObject();
+            Assert.Single(examples);
+            var example = examples["namedAgent"]!["value"]!;
+            Assert.Equal("GreetingAgent", example["model"]!.GetValue<string>());
+            Assert.Equal(requiresMaxTokens, example["max_tokens"] is not null);
+            var responsesContent = operation["responses"]!["200"]!["content"]!;
+            Assert.NotNull(responsesContent["application/json"]);
+            Assert.NotNull(responsesContent["text/event-stream"]);
+        }
 
         void AssertWorkflowFields(JsonNode operation, string type, string metadata, string alternateType, string alternateMetadata)
         {
