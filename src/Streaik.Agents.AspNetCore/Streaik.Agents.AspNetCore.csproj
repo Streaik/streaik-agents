@@ -11,6 +11,8 @@
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <InternalsVisibleTo Include="Streaik.Agents.HeaderAuth" />
     <ProjectReference Include="../Streaik.Agents/Streaik.Agents.csproj" />
+    <ProjectReference Include="../../../streaik-chat-completions/src/Streaik.ChatCompletions/Streaik.ChatCompletions.csproj" />
+    <ProjectReference Include="../../../streaik-messages/src/Streaik.Messages/Streaik.Messages.csproj" />
     <ProjectReference Include="../../../streaik-vercel/src/Streaik.Vercel/Streaik.Vercel.csproj" />
   </ItemGroup>
 </Project>

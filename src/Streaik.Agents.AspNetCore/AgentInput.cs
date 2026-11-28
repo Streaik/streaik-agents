@@ -11,7 +11,7 @@ namespace Streaik.Agents.AspNetCore;
 
 internal sealed record AgentInput(IReadOnlyList<Agent> Agents, AgentWorkflow Workflow,
     IReadOnlyList<ChatMessage> Messages, bool Stream, ChatOptions? Options = null, AgentBrowserTools? Browser = null,
-    AgentMcpApprovals? Mcp = null)
+    AgentMcpApprovals? Mcp = null, bool IncludeUsage = false)
 {
     private static readonly JsonSerializerOptions WebJson = new(JsonSerializerDefaults.Web);
 

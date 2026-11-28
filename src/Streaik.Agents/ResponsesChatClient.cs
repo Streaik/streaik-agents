@@ -12,7 +12,7 @@ namespace Streaik.Agents;
 internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, IReadOnlyDictionary<string, string>? headers,
     ChatOptions? defaults = null, AgentRunAccounting? accounting = null, HostedToolTurn? hosted = null,
     HostedToolDefinition[]? gatewayTools = null, ResponseToolDefinition[]? nativeTools = null, AgentMcpApprovals? approvals = null,
-    bool reportHostedActivity = false) : IChatClient
+    bool reportHostedActivity = false, bool standardProtocol = false) : IChatClient
 {
     private const int MaximumToolRounds = 12;
     private static readonly HashSet<string> ProtectedFields = new(StringComparer.OrdinalIgnoreCase)
@@ -38,9 +38,9 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             AccountFor(result, ref usage);
             continuation.Complete(result, approvals?.Execution, model.Id);
             review = ReadApprovals(result);
-            if (review.Count > 0 || !await ContinueHostedAsync(result, input, round, options, cancellationToken)) break;
+            if (IsOutputLimit(result) || review.Count > 0 || !await ContinueHostedAsync(result, input, round, options, cancellationToken)) break;
         }
-        var calls = GetFunctionCalls(result, options).ToList();
+        var calls = IsOutputLimit(result) ? [] : GetFunctionCalls(result, options).ToList();
         var contents = new List<AIContent>();
         if (GetText(result) is { Length: > 0 } text) contents.Add(new TextContent(text));
         contents.AddRange(calls);
@@ -49,7 +49,7 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
         {
             ModelId = result.Model,
             ResponseId = result.Id,
-            FinishReason = calls.Count == 0 ? ChatFinishReason.Stop : ChatFinishReason.ToolCalls,
+            FinishReason = IsOutputLimit(result) ? ChatFinishReason.Length : calls.Count == 0 ? ChatFinishReason.Stop : ChatFinishReason.ToolCalls,
             Usage = usage
         };
     }
@@ -85,6 +85,7 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
                     yield return new ChatResponseUpdate(ChatRole.Assistant, delta.Delta);
                 }
                 else if (part is ResponseCompleted completed) { result = completed.Response; break; }
+                else if (part is ResponseIncompleteEvent incomplete && IsOutputLimit(incomplete.Response)) { result = incomplete.Response; break; }
                 else if (part is ResponseFailed or ResponseError or ResponseIncompleteEvent)
                     throw new InvalidOperationException("The upstream did not complete the response.");
                 else if (relay && ReadGatewayActivity(part) is { } activity)
@@ -113,7 +114,7 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             continuation.Receipts.Clear();
             var review = ReadApprovals(result);
             var pausedLocalCall = false;
-            if (review.Count == 0 && HostedCall(result, round, options) is { } localCall)
+            if (!IsOutputLimit(result) && review.Count == 0 && HostedCall(result, round, options) is { } localCall)
             {
                 if (reportHostedActivity)
                 {
@@ -128,11 +129,12 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
                 pausedLocalCall = true;
             }
             // The paused call belongs to this host, not to the browser function dispatcher.
-            var calls = pausedLocalCall ? [] : GetFunctionCalls(result, options).ToList();
+            var calls = pausedLocalCall || IsOutputLimit(result) ? [] : GetFunctionCalls(result, options).ToList();
             var terminal = new ChatResponseUpdate
             {
                 Role = ChatRole.Assistant, ModelId = result.Model, ResponseId = result.Id,
-                FinishReason = calls.Count == 0 && review.Count == 0 ? ChatFinishReason.Stop : ChatFinishReason.ToolCalls
+                FinishReason = IsOutputLimit(result) ? ChatFinishReason.Length
+                    : calls.Count == 0 && review.Count == 0 ? ChatFinishReason.Stop : ChatFinishReason.ToolCalls
             };
             foreach (var call in calls) terminal.Contents.Add(call);
             foreach (var item in review) terminal.Contents.Add(item);
@@ -274,6 +276,8 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             .Where(decision => Streaik.Vercel.Security.HostedToolContinuation.IsResult(decision.Part)).Select(decision => decision.Part.ToolCallId).ToHashSet(StringComparer.Ordinal);
         foreach (var message in history)
         {
+            if (standardProtocol && hosted is not null && message.Contents.OfType<FunctionCallContent>().Any(call => hosted.Owns(call.Name)))
+                throw new AgentRequestException("Caller tool history cannot represent an agent-hosted tool.", "invalid_agent_tool");
             continuation.Items.AddRange(MapMessage(message));
             foreach (var decision in message.Contents.OfType<AgentExecutionApproval.Decision>())
             {
@@ -377,7 +381,8 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
             TopP = options?.TopP ?? defaults?.TopP,
             MaxOutputTokens = options?.MaxOutputTokens ?? defaults?.MaxOutputTokens,
             Tools = tools,
-            ParallelToolCalls = enableTools && (hosted is not null || gatewayTools is { Length: > 0 }) ? false : null,
+            ParallelToolCalls = enableTools && (hosted is not null || gatewayTools is { Length: > 0 }) ? false
+                : enableTools && standardProtocol ? options?.AllowMultipleToolCalls : null,
             ToolChoice = options?.ToolMode switch
             {
                 RequiredChatToolMode { RequiredFunctionName: { } name } => new { type = "function", name },
@@ -458,12 +463,14 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
         }
     };
 
-    private static IEnumerable<FunctionCallContent> GetFunctionCalls(ResponseResult result, ChatOptions? options)
+    private IEnumerable<FunctionCallContent> GetFunctionCalls(ResponseResult result, ChatOptions? options)
     {
         foreach (var call in result.OutputItems.OfType<ResponseFunctionCallItem>())
         {
             if (options?.Tools?.OfType<AIFunctionDeclaration>().Any(tool => tool.Name == call.Name) != true
-                || string.IsNullOrEmpty(call.CallId))
+                || string.IsNullOrEmpty(call.CallId)
+                || standardProtocol && (call.Namespace is not null || options.ToolMode is NoneChatToolMode
+                    || options.ToolMode is RequiredChatToolMode { RequiredFunctionName: { } required } && required != call.Name))
                 throw new InvalidOperationException("The gateway returned an unexpected function call.");
             var arguments = JsonSerializer.Deserialize<Dictionary<string, object?>>(call.Arguments)
                 ?? throw new JsonException("Function call arguments must be a JSON object.");
@@ -472,9 +479,13 @@ internal sealed class ResponsesChatClient(HttpClient gateway, AgentModel model, 
         }
     }
 
-    private static void CheckResult(ResponseResult result)
+    private bool IsOutputLimit(ResponseResult result) => standardProtocol && result.Status == "incomplete"
+        && result.IncompleteDetails is { ValueKind: JsonValueKind.Object } details
+        && details.TryGetProperty("reason", out var reason) && reason.ValueKind == JsonValueKind.String && reason.ValueEquals("max_output_tokens");
+
+    private void CheckResult(ResponseResult result)
     {
-        if (result.Status != "completed" || result.Error is not null)
+        if (result.Error is not null || result.Status != "completed" && !IsOutputLimit(result))
             throw new InvalidOperationException("The upstream did not complete the response.");
     }
 

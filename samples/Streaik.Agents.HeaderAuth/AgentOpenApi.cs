@@ -3,6 +3,8 @@ using Microsoft.AspNetCore.OpenApi;
 using Microsoft.OpenApi;
 using Scalar.AspNetCore;
 using Streaik.Agents.AspNetCore;
+using Streaik.ChatCompletions.Models;
+using Streaik.Messages;
 using Streaik.Responses;
 
 namespace Streaik.Agents.HeaderAuth;
@@ -53,8 +55,27 @@ internal static class AgentOpenApi
         {
             if (context.Description.ActionDescriptor.EndpointMetadata.OfType<AgentRequestBodyMetadata>().LastOrDefault() is not { } body) return;
             var ui = body.Type == typeof(AgentChatRequest);
-            operation.Description = (ui ? "Returns AI SDK UI Message Stream events. Use workflowType and workflowMetadata for workflow options. "
-                : "Returns a Responses object, or Responses SSE events when stream is true. Use workflow_type and workflow_metadata for workflow options. ") + Routing + " " + ProviderAuth;
+            var completions = body.Type == typeof(ChatCompletionOptions);
+            var messages = body.Type == typeof(MessagesRequest);
+            var standard = completions || messages;
+            operation.Description = standard
+                ? $"Returns {(completions ? "OpenAI Chat Completions" : "Anthropic Messages")} JSON, or SSE when stream is true. "
+                    + "Use model to select one catalog agent. Runs are stateless and support text and caller-executed function tools only. "
+                    + (messages ? "Provide a positive max_tokens. Use Streaik credentials, not x-api-key. " : "Only one choice is supported. ") + ProviderAuth
+                : (ui ? "Returns AI SDK UI Message Stream events. Use workflowType and workflowMetadata for workflow options. "
+                    : "Returns a Responses object, or Responses SSE events when stream is true. Use workflow_type and workflow_metadata for workflow options. ") + Routing + " " + ProviderAuth;
+            var examples = new Dictionary<string, IOpenApiExample>
+            {
+                ["namedAgent"] = Example("Single catalog agent", completions
+                    ? """{"model":"GreetingAgent","messages":[{"role":"user","content":"Say hi"}]}"""
+                    : messages ? """{"model":"GreetingAgent","max_tokens":128,"messages":[{"role":"user","content":"Say hi"}]}"""
+                    : ui ? """{"model":"GreetingAgent","messages":[{"id":"1","role":"user","parts":[{"type":"text","text":"Say hi"}]}]}"""
+                    : """{"model":"GreetingAgent","input":"Say hi"}""")
+            };
+            if (!standard)
+                examples["workflow"] = Example("Sequential inline workflow", ui
+                    ? """{"agents":[{"name":"Draft","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Write a draft."},{"name":"Review","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Review the draft."}],"workflowType":"sequential","messages":[{"id":"1","role":"user","parts":[{"type":"text","text":"Write a short welcome note"}]}]}"""
+                    : """{"agents":[{"name":"Draft","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Write a draft."},{"name":"Review","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Review the draft."}],"workflow_type":"sequential","input":"Write a short welcome note"}""");
             operation.RequestBody = new OpenApiRequestBody
             {
                 Required = true,
@@ -63,15 +84,7 @@ internal static class AgentOpenApi
                     ["application/json"] = new OpenApiMediaType
                     {
                         Schema = await context.GetOrCreateSchemaAsync(body.Type, cancellationToken: ct),
-                        Examples = new Dictionary<string, IOpenApiExample>
-                        {
-                            ["namedAgent"] = Example("Single catalog agent", ui
-                                ? """{"model":"GreetingAgent","messages":[{"id":"1","role":"user","parts":[{"type":"text","text":"Say hi"}]}]}"""
-                                : """{"model":"GreetingAgent","input":"Say hi"}"""),
-                            ["workflow"] = Example("Sequential inline workflow", ui
-                                ? """{"agents":[{"name":"Draft","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Write a draft."},{"name":"Review","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Review the draft."}],"workflowType":"sequential","messages":[{"id":"1","role":"user","parts":[{"type":"text","text":"Write a short welcome note"}]}]}"""
-                                : """{"agents":[{"name":"Draft","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Write a draft."},{"name":"Review","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Review the draft."}],"workflow_type":"sequential","input":"Write a short welcome note"}""")
-                        }
+                        Examples = examples
                     }
                 }
             };
@@ -80,12 +93,18 @@ internal static class AgentOpenApi
             operation.Responses ??= new();
             foreach (var (status, description) in new[] { ("400", "Invalid agent request"), ("401", "Missing or rejected credentials"),
                 ("403", "Gateway authorization rejected"), ("404", "Named agent not found"), ("415", "Request must be JSON"),
-                ("429", "Gateway rate limit reached"), ("502", "Gateway run failed"), ("504", "Gateway timed out") })
+                ("429", "Gateway rate limit reached"), ("502", "Gateway run failed"), ("503", "Agent catalog unavailable"), ("504", "Gateway timed out") })
                 operation.Responses[status] = new OpenApiResponse { Description = description };
         });
         options.AddSchemaTransformer((schema, context, _) =>
         {
             var type = context.JsonTypeInfo.Type;
+            if (type == typeof(MessagesContent) || type == typeof(ChatMessageContent))
+            {
+                schema.Type = null;
+                schema.AnyOf = [Text(), new OpenApiSchema { Type = JsonSchemaType.Array, Items = new OpenApiSchema { Type = JsonSchemaType.Object } }];
+                schema.Description = "Text or supported protocol content blocks.";
+            }
             if (type == typeof(ResponseInput))
             {
                 schema.Type = null;
@@ -109,7 +128,7 @@ internal static class AgentOpenApi
         const string other = "Other";
         var pathsByCapability = document.Paths.Where(path => path.Value.Operations is { Count: > 0 }).ToLookup(path => path.Key switch
         {
-            "/v1/responses" or "/api/chat" => "Chat",
+            "/v1/responses" or "/api/chat" or "/v1/chat/completions" or "/v1/messages" => "Chat",
             "/v1/models" => "LLM",
             _ when path.Key.StartsWith("/v1/models/", StringComparison.Ordinal) => "LLM",
             _ => other

@@ -33,6 +33,18 @@ jobs:
           repository: Streaik/streaik-vercel
           path: streaik-vercel
 
+      - name: Checkout Chat Completions
+        uses: actions/checkout@v4
+        with:
+          repository: Streaik/streaik-chat-completions
+          path: streaik-chat-completions
+
+      - name: Checkout Messages
+        uses: actions/checkout@v4
+        with:
+          repository: Streaik/streaik-messages
+          path: streaik-messages
+
       - name: Checkout Tools
         uses: actions/checkout@v4
         with:
