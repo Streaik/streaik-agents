@@ -110,21 +110,27 @@ public sealed partial class AgentRuntime
             if (router is not null && candidates.Length > 1 && await headersFor(agent, router, true) is { } routerHeaders)
                 answer = await SelectModelAsync(agent, router, candidates, catalog, messages, ModelHeaders(router, routerHeaders), ct, accounting) ?? answer;
 
-            var headers = await headersFor(agent, answer, false) ?? EmptyHeaders;
-            var tools = AgentHostedTools.Read(agent);
-            var skillHeaders = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.Ordinal) { [GetProvider(answer)] = headers };
-            if (hostedAccess?.ResolveSkill is null)
-                foreach (var provider in SkillProviders(agent).Distinct(StringComparer.Ordinal))
-                    if (!skillHeaders.ContainsKey(provider))
-                        skillHeaders[provider] = await headersFor(agent, new AgentModel { Id = $"{provider}/skill" }, false) ?? EmptyHeaders;
-            targets.Add(new AgentRunTarget(agent, answer, ModelHeaders(answer, headers), tools, (reference, cancellationToken) =>
-            {
-                var (provider, path) = SkillRoute(reference);
-                return DownloadSkillAsync(path, ScopeHeaders(skillHeaders[provider], new(StringComparer.Ordinal) { provider }), cancellationToken);
-            }));
+            targets.Add(await CreateTargetAsync(agent, answer, headersFor));
         }
         ct.ThrowIfCancellationRequested();
         return targets;
+    }
+
+    internal async Task<AgentRunTarget> CreateTargetAsync(Agent agent, AgentModel answer,
+        Func<Agent, AgentModel, bool, ValueTask<IReadOnlyDictionary<string, string>?>> headersFor)
+    {
+        var headers = await headersFor(agent, answer, false) ?? EmptyHeaders;
+        var tools = AgentHostedTools.Read(agent);
+        var skillHeaders = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.Ordinal) { [GetProvider(answer)] = headers };
+        if (hostedAccess?.ResolveSkill is null)
+            foreach (var provider in SkillProviders(agent).Distinct(StringComparer.Ordinal))
+                if (!skillHeaders.ContainsKey(provider))
+                    skillHeaders[provider] = await headersFor(agent, new AgentModel { Id = $"{provider}/skill" }, false) ?? EmptyHeaders;
+        return new AgentRunTarget(agent, answer, ModelHeaders(answer, headers), tools, (reference, cancellationToken) =>
+        {
+            var (provider, path) = SkillRoute(reference);
+            return DownloadSkillAsync(path, ScopeHeaders(skillHeaders[provider], new(StringComparer.Ordinal) { provider }), cancellationToken);
+        });
     }
 
     private static string? ModelType(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim().ToLowerInvariant();

@@ -60,7 +60,10 @@ internal static class AgentOpenApi
             var standard = completions || messages;
             operation.Description = standard
                 ? $"Returns {(completions ? "OpenAI Chat Completions" : "Anthropic Messages")} JSON, or SSE when stream is true. "
-                    + "Use model to select one catalog agent. Runs are stateless and support text and caller-executed function tools only. "
+                    + "Select catalog agents with model or models, or supply full inline definitions with agent or agents. Omit model when using another selector. "
+                    + "Use workflow_type and workflow_metadata as on Responses; multiple participants default to sequential. "
+                    + "If a response includes workflow_continuation, POST it back to the same endpoint with only the requested tool results and the same credentials. "
+                    + "The checkpoint is single-use, expires after 10 minutes, and is available only on the original server process. "
                     + (messages ? "Provide a positive max_tokens. Use Streaik credentials, not x-api-key. " : "Only one choice is supported. ") + ProviderAuth
                 : (ui ? "Returns AI SDK UI Message Stream events. Use workflowType and workflowMetadata for workflow options. "
                     : "Returns a Responses object, or Responses SSE events when stream is true. Use workflow_type and workflow_metadata for workflow options. ") + Routing + " " + ProviderAuth;
@@ -72,7 +75,16 @@ internal static class AgentOpenApi
                     : ui ? """{"model":"GreetingAgent","messages":[{"id":"1","role":"user","parts":[{"type":"text","text":"Say hi"}]}]}"""
                     : """{"model":"GreetingAgent","input":"Say hi"}""")
             };
-            if (!standard)
+            if (standard)
+            {
+                examples["workflow"] = Example("Sequential catalog workflow without model", completions
+                    ? """{"models":["GreetingAgent","ReviewAgent"],"workflow_type":"sequential","messages":[{"role":"user","content":"Write a short welcome note"}]}"""
+                    : """{"models":["GreetingAgent","ReviewAgent"],"workflow_type":"sequential","max_tokens":128,"messages":[{"role":"user","content":"Write a short welcome note"}]}""");
+                examples["continueWorkflow"] = Example("Resume with the tool result and the token from the previous response", completions
+                    ? """{"workflow_continuation":"TOKEN_FROM_RESPONSE","messages":[{"role":"tool","tool_call_id":"call_weather","content":"sunny"}]}"""
+                    : """{"workflow_continuation":"TOKEN_FROM_RESPONSE","max_tokens":128,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_weather","content":"sunny"}]}]}""");
+            }
+            else
                 examples["workflow"] = Example("Sequential inline workflow", ui
                     ? """{"agents":[{"name":"Draft","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Write a draft."},{"name":"Review","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Review the draft."}],"workflowType":"sequential","messages":[{"id":"1","role":"user","parts":[{"type":"text","text":"Write a short welcome note"}]}]}"""
                     : """{"agents":[{"name":"Draft","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Write a draft."},{"name":"Review","model":{"id":"openai/gpt-4.1-mini"},"instructions":"Review the draft."}],"workflow_type":"sequential","input":"Write a short welcome note"}""");
@@ -99,6 +111,8 @@ internal static class AgentOpenApi
         options.AddSchemaTransformer((schema, context, _) =>
         {
             var type = context.JsonTypeInfo.Type;
+            // This endpoint also accepts catalog lists and inline definitions through extension data.
+            if (type == typeof(MessagesRequest)) schema.Required?.Remove("model");
             if (type == typeof(MessagesContent) || type == typeof(ChatMessageContent))
             {
                 schema.Type = null;

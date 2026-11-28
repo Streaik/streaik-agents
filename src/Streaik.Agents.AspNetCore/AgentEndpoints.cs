@@ -1,13 +1,17 @@
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
 using Streaik.ChatCompletions.Models;
 using Streaik.Messages;
 using Streaik.Responses;
+using Streaik.Tools;
 
 namespace Streaik.Agents.AspNetCore;
 
@@ -50,6 +54,9 @@ public static class AgentEndpoints
             ? AgentProtocolOutput.ErrorAsync(context, protocol, status, code, message)
             : ErrorAsync(context, status, code, message);
         AgentInput input;
+        JsonElement body;
+        WorkflowResumeRequest? resume = null;
+        WorkflowContinuation? saved = null;
         try
         {
             if (!context.Request.HasJsonContentType())
@@ -57,9 +64,22 @@ public static class AgentEndpoints
                 await Error(415, "invalid_request", "Send the request as JSON.");
                 return;
             }
-            var body = await context.Request.ReadFromJsonAsync<JsonElement>(ct);
-            input = standard ? await AgentProtocolInput.ParseAsync(body, catalog, protocol, ct)
-                : await AgentInput.ParseAsync(body, catalog, ui, context, ct);
+            body = await context.Request.ReadFromJsonAsync<JsonElement>(ct);
+            if (standard) resume = AgentProtocolInput.ReadResume(body, protocol == AgentEndpointProtocol.ChatCompletions);
+            if (resume is null)
+                input = standard ? await AgentProtocolInput.ParseAsync(body, catalog, protocol, ct)
+                    : await AgentInput.ParseAsync(body, catalog, ui, context, ct);
+            else
+            {
+                var store = context.RequestServices.GetRequiredService<IAgentWorkflowContinuationStore>();
+                var bytes = await store.FindAsync(resume.Token, ct);
+                saved = bytes is null ? null : JsonSerializer.Deserialize<WorkflowContinuation>(bytes);
+                if (saved is null || saved.Protocol != protocol) throw InvalidContinuation();
+                body = saved.Request;
+                var original = AgentProtocolInput.Decode(body, protocol == AgentEndpointProtocol.ChatCompletions);
+                input = new(saved.Targets.Select(target => target.Definition).ToArray(), saved.Workflow, original.History,
+                    resume.Stream, original.Options, IncludeUsage: resume.IncludeUsage);
+            }
         }
         catch (AgentRequestException error)
         {
@@ -87,10 +107,10 @@ public static class AgentEndpoints
             long? started = input.Stream ? clock.GetTimestamp() : null;
             var credentials = context.RequestServices.GetService<IAgentGatewayHeaders>();
             var participants = input.Agents;
-            var router = participants.Count > 1 ? input.Workflow.Router : null;
+            var router = saved is null && participants.Count > 1 ? input.Workflow.Router : null;
             var providers = (router is null ? participants : participants.Append(router)).SelectMany(AgentRuntime.PotentialProviders)
                 .Concat(participants.SelectMany(AgentRuntime.SkillProviders));
-            var singleProvider = providers.Distinct(StringComparer.Ordinal).Take(2).Count() == 1;
+            var singleProvider = saved?.SingleProvider ?? providers.Distinct(StringComparer.Ordinal).Take(2).Count() == 1;
             var headerCache = new Dictionary<(Agent, AgentModel), IReadOnlyDictionary<string, string>>();
 
             async ValueTask<IReadOnlyDictionary<string, string>?> HeadersFor(Agent agent, AgentModel model, bool optional)
@@ -111,13 +131,45 @@ public static class AgentEndpoints
                 participants = [await runtime.SelectAgentAsync(router, participants, input.Messages,
                     runtime.ModelHeaders(router.Model!, (await HeadersFor(router, router.Model!, false))!), ct, accounting)];
             // Resolve only the chosen agents, once per workflow run, before running answer inference.
-            var targets = await runtime.ResolveTargetsAsync(participants, input.Messages, HeadersFor, ct, accounting);
+            IReadOnlyList<AgentRunTarget> targets;
+            WorkflowToolExchange? exchange = null;
+            async Task<string> GetOwnerAsync(IReadOnlyList<AgentRunTarget> resolved)
+            {
+                var subject = McpResultReviews.Subject(context.User);
+                var headers = new List<IReadOnlyDictionary<string, string>>();
+                if (subject is null)
+                    foreach (var target in resolved)
+                        headers.Add((await HeadersFor(target.Definition, target.Model, false))!);
+                return context.RequestServices.GetRequiredService<AgentWorkflowOwner>().Identify(subject, headers);
+            }
+
+            if (saved is not null)
+            {
+                var restored = new List<AgentRunTarget>(saved.Targets.Length);
+                foreach (var target in saved.Targets)
+                    restored.Add(await runtime.CreateTargetAsync(target.Definition, target.Model, HeadersFor));
+                targets = restored;
+                if (saved.Owner != await GetOwnerAsync(targets)) throw InvalidContinuation();
+                if (resume!.Results.Count != saved.Calls.Length || saved.Calls.Any(call => !resume.Results.ContainsKey(call.Call.CallId)))
+                    throw new AgentRequestException("Provide exactly one result for each pending workflow tool call.");
+                if (resume.MaxOutputTokens is { } max && max != input.Options?.MaxOutputTokens)
+                    throw new AgentRequestException("Keep the original 'max_tokens' when resuming a workflow.");
+                var store = context.RequestServices.GetRequiredService<IAgentWorkflowContinuationStore>();
+                if (!await store.ConsumeAsync(resume.Token, ct)) throw InvalidContinuation();
+                exchange = new(saved.Checkpoint, saved.Calls, resume.Results);
+            }
+            else
+            {
+                targets = await runtime.ResolveTargetsAsync(participants, input.Messages, HeadersFor, ct, accounting);
+                if (standard && input.Agents.Count > 1 && input.Options?.Tools is { Count: > 0 } && input.Options.ToolMode is not NoneChatToolMode)
+                    exchange = new();
+            }
 
             var primary = targets[0];
             var model = participants.Count == 1 ? primary.Definition.Name! : input.Workflow.Type;
             if (standard) protocolOutput = new(context.Response, protocol, model, ct, accounting, clock, input.IncludeUsage);
             else output = new(context.Response, model, ui, ct, accounting, clock, started, input.Browser?.Signer);
-            if (!input.Stream && participants.Count == 1)
+            if (!input.Stream && participants.Count == 1 && exchange is null)
             {
                 var result = await runtime.RunResolvedAsync(primary, input.Messages, input.Options, ct, input.Mcp, accounting, standard);
                 if (protocolOutput is not null) await protocolOutput.WriteResultAsync(result);
@@ -129,9 +181,42 @@ public static class AgentEndpoints
                 return;
             }
 
-            var updates = participants.Count == 1
+            var updates = participants.Count == 1 && exchange is null
                 ? runtime.StreamResolvedAsync(primary, input.Messages, input.Options, ct, input.Mcp, reportHostedActivity: ui, accounting: accounting, standardProtocol: standard)
-                : runtime.RunWorkflowAsync(input.Workflow, targets, input.Messages.ToList(), input.Options, input.Stream, ct, accounting, reportHostedActivity: ui);
+                : runtime.RunWorkflowAsync(input.Workflow, targets, input.Messages.ToList(), input.Options, input.Stream, ct, accounting,
+                    reportHostedActivity: ui, standardProtocol: standard, exchange: exchange);
+            if (protocolOutput is not null && (!input.Stream || exchange is not null))
+            {
+                var text = new StringBuilder();
+                await foreach (var update in updates.WithCancellation(ct)) text.Append(update.Text);
+                string? continuation = null;
+                FunctionCallContent[] calls = [];
+                if (exchange?.Pending.Count > 0)
+                {
+                    // Different branches can reuse a provider call ID. Expose only one of each ID per
+                    // token; the other request remains pending in the framework checkpoint.
+                    var pending = exchange.Pending.Values.OrderBy(call => call.RequestId, StringComparer.Ordinal)
+                        .DistinctBy(call => call.Call.CallId, StringComparer.Ordinal).ToArray();
+                    calls = pending.Select(call => call.Call).ToArray();
+                    var checkpoint = exchange.Checkpoints.Latest ?? throw new InvalidOperationException("The paused workflow did not checkpoint.");
+                    var owner = await GetOwnerAsync(targets);
+                    var state = new WorkflowContinuation(protocol, owner, singleProvider,
+                        targets.Select(target => new WorkflowTarget(target.Definition, target.Model)).ToArray(), input.Workflow, body, checkpoint, pending);
+                    continuation = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+                    var store = context.RequestServices.GetRequiredService<IAgentWorkflowContinuationStore>();
+                    await store.SaveAsync(continuation, JsonSerializer.SerializeToUtf8Bytes(state), ct);
+                }
+                if (!input.Stream)
+                    await protocolOutput.WriteResultAsync(text.ToString(), calls, continuation: continuation);
+                else
+                {
+                    await protocolOutput.StartAsync();
+                    if (text.Length > 0) await protocolOutput.WriteAsync(new AgentResponseUpdate(ChatRole.Assistant, text.ToString()));
+                    foreach (var call in calls) await protocolOutput.WriteAsync(new AgentResponseUpdate(ChatRole.Assistant, new List<AIContent> { call }));
+                    await protocolOutput.CompleteAsync(continuation);
+                }
+                return;
+            }
             if (!input.Stream)
             {
                 var text = new StringBuilder();
@@ -187,6 +272,8 @@ public static class AgentEndpoints
             else await Error(status, code, message);
         }
     }
+
+    private static AgentRequestException InvalidContinuation() => new("The workflow continuation is invalid, expired, or already used.", "invalid_workflow_continuation");
 
     private static Task ErrorAsync(HttpContext context, int status, string code, string message)
     {

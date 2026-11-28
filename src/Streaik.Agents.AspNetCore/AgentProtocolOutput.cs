@@ -22,28 +22,32 @@ internal sealed class AgentProtocolOutput(HttpResponse response, AgentEndpointPr
     private bool _textBlockOpen;
     private ChatFinishReason? _finishReason;
 
-    public Task WriteResultAsync(AgentResponse result)
+    public Task WriteResultAsync(AgentResponse result) => WriteResultAsync(result.Text,
+        result.Messages.SelectMany(message => message.Contents.OfType<FunctionCallContent>()).ToArray(),
+        (result.RawRepresentation as ChatResponse)?.FinishReason);
+
+    public Task WriteResultAsync(string text, FunctionCallContent[] calls, ChatFinishReason? finish = null, string? continuation = null)
     {
-        var calls = result.Messages.SelectMany(message => message.Contents.OfType<FunctionCallContent>()).ToArray();
-        var finish = (result.RawRepresentation as ChatResponse)?.FinishReason;
         if (IsChat)
             return response.WriteAsJsonAsync(new ChatCompletion
             {
                 Id = _id, Created = _created, Model = model, Usage = ChatUsage(),
+                AdditionalProperties = Continuation(continuation),
                 Choices = [new() { FinishReason = Finish(finish, calls.Length > 0), Message = new()
                 {
-                    Content = result.Text.Length > 0 || calls.Length == 0 ? result.Text : null,
+                    Content = text.Length > 0 || calls.Length == 0 ? text : null,
                     ToolCalls = calls.Length == 0 ? null : calls.Select(call => new ChatCompletionMessageToolCall
                         { Id = call.CallId, Function = new() { Name = call.Name, Arguments = Arguments(call).GetRawText() } }),
-                    AdditionalProperties = result.Text.Length == 0 && calls.Length > 0 ? new() { ["content"] = Null } : null
+                    AdditionalProperties = text.Length == 0 && calls.Length > 0 ? new() { ["content"] = Null } : null
                 } }]
             }, ct);
 
         var message = Message(MessagesUsage());
-        if (result.Text.Length > 0) message.Content.Add(new() { Type = "text", Text = result.Text });
+        if (text.Length > 0) message.Content.Add(new() { Type = "text", Text = text });
         message.Content.AddRange(calls.Select(call => ToolUse(call, Arguments(call))));
         message.StopReason = Finish(finish, calls.Length > 0);
-        message.AdditionalProperties = new() { ["stop_sequence"] = Null };
+        message.AdditionalProperties = Continuation(continuation) ?? new();
+        message.AdditionalProperties["stop_sequence"] = Null;
         return response.WriteAsJsonAsync(message, MessagesJson.Default, ct);
     }
 
@@ -94,19 +98,19 @@ internal sealed class AgentProtocolOutput(HttpResponse response, AgentEndpointPr
         }
     }
 
-    public async Task CompleteAsync()
+    public async Task CompleteAsync(string? continuation = null)
     {
         var finish = Finish(_finishReason, _toolIndex > 0);
         if (IsChat)
         {
-            await ChunkAsync(new(), finish);
+            await ChunkAsync(new(), finish, continuation);
             if (includeUsage) await WriteChunkAsync([], ChatUsage());
             await FrameAsync("[DONE]");
         }
         else
         {
             await CloseTextAsync();
-            await EventAsync(new() { Type = "message_delta", Usage = MessagesUsage(), Delta = new()
+            await EventAsync(new() { Type = "message_delta", Usage = MessagesUsage(), AdditionalProperties = Continuation(continuation), Delta = new()
             {
                 StopReason = finish, AdditionalProperties = new() { ["stop_sequence"] = Null }
             } });
@@ -174,11 +178,15 @@ internal sealed class AgentProtocolOutput(HttpResponse response, AgentEndpointPr
         await EventAsync(new() { Type = "content_block_stop", Index = _blockIndex++ });
     }
 
-    private Task ChunkAsync(ChatCompletionDelta delta, string? finish = null) => WriteChunkAsync([new()
-        { Delta = delta, FinishReason = finish, AdditionalProperties = finish is null ? new() { ["finish_reason"] = Null } : null }]);
+    private static Dictionary<string, JsonElement>? Continuation(string? token) => token is null ? null
+        : new() { [AgentProtocolInput.ContinuationField] = JsonSerializer.SerializeToElement(token) };
 
-    private Task WriteChunkAsync(ChatCompletionStreamChoice[] choices, ChatCompletionUsage? usage = null) => FrameAsync(JsonSerializer.Serialize(
-        new ChatCompletionUpdate { Id = _id, Created = _created, Model = model, Choices = choices, Usage = usage }, includeUsage ? JsonSerializerOptions.Default : OmitNull));
+    private Task ChunkAsync(ChatCompletionDelta delta, string? finish = null, string? continuation = null) => WriteChunkAsync([new()
+        { Delta = delta, FinishReason = finish, AdditionalProperties = finish is null ? new() { ["finish_reason"] = Null } : null }], continuation: continuation);
+
+    private Task WriteChunkAsync(ChatCompletionStreamChoice[] choices, ChatCompletionUsage? usage = null, string? continuation = null) => FrameAsync(JsonSerializer.Serialize(
+        new ChatCompletionUpdate { Id = _id, Created = _created, Model = model, Choices = choices, Usage = usage,
+            AdditionalProperties = Continuation(continuation) }, includeUsage ? JsonSerializerOptions.Default : OmitNull));
 
     private Task EventAsync(MessageStreamPart part) => FrameAsync(JsonSerializer.Serialize(part, MessagesJson.Default), part.Type);
 

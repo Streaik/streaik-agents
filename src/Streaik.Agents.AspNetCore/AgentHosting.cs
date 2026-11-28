@@ -22,6 +22,9 @@ public static class AgentHosting
         services.AddSingleton<AgentCatalog>();
         services.TryAddSingleton(new McpResultReviews());
         services.TryAddSingleton(new McpApprovalDecisions());
+        services.TryAddSingleton<AgentWorkflowOwner>();
+        services.TryAddSingleton<IAgentWorkflowContinuationStore>(provider =>
+            new InMemoryAgentWorkflowContinuationStore(provider.GetService<TimeProvider>() ?? TimeProvider.System));
         if (configuration["ToolApprovalSigningSecret"] is { } secret && !string.IsNullOrWhiteSpace(secret))
             services.TryAddSingleton(new AgentToolApprovalSigning(secret));
         services.AddHttpClient(GatewayClientName, client => client.BaseAddress = baseAddress)

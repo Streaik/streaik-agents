@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 using Microsoft.Extensions.AI;
 using Streaik.ChatCompletions.Models;
 using Streaik.Messages;
@@ -10,33 +11,77 @@ internal static class AgentProtocolInput
 {
     private static readonly JsonElement EmptySchema = JsonSerializer.SerializeToElement(new { type = "object", properties = new { } });
     private static readonly JsonSerializerOptions ChatJson = new() { PropertyNameCaseInsensitive = true };
+    private static readonly JsonSerializerOptions ExtensionJson = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions AgentMessagesJson = new(MessagesJson.Default)
+    {
+        TypeInfoResolver = new DefaultJsonTypeInfoResolver { Modifiers = { type =>
+        {
+            // The endpoint has alternative selectors. The shared Messages contract still requires model.
+            if (type.Type == typeof(MessagesRequest))
+                type.Properties.Single(property => property.Name == "model").IsRequired = false;
+        } } }
+    };
+    private const string WorkflowType = AgentResponsesRequest.WorkflowTypeField;
+    private const string WorkflowMetadataField = AgentResponsesRequest.WorkflowMetadataField;
+    internal const string ContinuationField = "workflow_continuation";
+    private static readonly HashSet<string> RoutingFields = new(StringComparer.OrdinalIgnoreCase)
+        { "models", "agent", "agents", WorkflowType, WorkflowMetadataField };
 
     public static async Task<AgentInput> ParseAsync(JsonElement body, AgentCatalog catalog, AgentEndpointProtocol protocol, CancellationToken ct)
     {
         var chat = protocol == AgentEndpointProtocol.ChatCompletions;
-        var fields = chat
+        ValidateFields(body, chat
             ? new[] { "model", "messages", "stream", "stream_options", "max_tokens", "max_completion_tokens", "temperature", "top_p",
                 "n", "store", "tools", "tool_choice", "parallel_tool_calls" }
-            : ["model", "messages", "system", "stream", "max_tokens", "temperature", "top_p", "tools", "tool_choice"];
+            : ["model", "messages", "system", "stream", "max_tokens", "temperature", "top_p", "tools", "tool_choice"], allowRouting: true);
+        var request = Decode(body, chat);
+        if (!request.History.Any(message => message.Role == ChatRole.User && !string.IsNullOrWhiteSpace(message.Text)))
+            throw new AgentRequestException("Provide at least one user text message.");
+        Dictionary<string, JsonElement> extensions = request.AdditionalProperties is null ? new(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, JsonElement>(request.AdditionalProperties, StringComparer.OrdinalIgnoreCase);
+        T? Read<T>(string key) where T : class => extensions.TryGetValue(key, out var value) && value.ValueKind != JsonValueKind.Null
+            ? value.Deserialize<T>(ExtensionJson) : null;
+        var agents = await AgentInput.ResolveAgentsAsync(catalog, request.Model, Read<string?[]>("models"), Read<Agent>("agent"), Read<Agent?[]>("agents"), ct);
+        return new(agents, AgentWorkflow.Validate(Read<string>(WorkflowType), Read<WorkflowMetadata>(WorkflowMetadataField), agents, WorkflowType, WorkflowMetadataField),
+            request.History, request.Stream, request.Options, IncludeUsage: request.IncludeUsage);
+    }
+
+    private static void ValidateFields(JsonElement body, string[] fields, bool allowRouting)
+    {
         if (body.ValueKind != JsonValueKind.Object) throw new AgentRequestException("The request body must be a JSON object.");
+        AgentInput.RejectAlternateField(body, WorkflowType, AgentChatRequest.WorkflowTypeField);
+        AgentInput.RejectAlternateField(body, WorkflowMetadataField, AgentChatRequest.WorkflowMetadataField);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var property in body.EnumerateObject())
         {
             if (!seen.Add(property.Name)) throw new AgentRequestException("The request has duplicate fields.");
-            if (property.Value.ValueKind != JsonValueKind.Null && !fields.Contains(property.Name, StringComparer.OrdinalIgnoreCase))
+            if (property.Value.ValueKind != JsonValueKind.Null && !(allowRouting && RoutingFields.Contains(property.Name))
+                && !fields.Contains(property.Name, StringComparer.OrdinalIgnoreCase))
                 throw new AgentRequestException("The request includes a field not supported by this agent endpoint.");
         }
-
-        var request = chat ? FromChat(body.Deserialize<ChatCompletionOptions>(ChatJson)!) : FromMessages(body.Deserialize<MessagesRequest>(MessagesJson.Default)!);
-        if (string.IsNullOrWhiteSpace(request.Model)) throw new AgentRequestException("'model' must name a catalog agent.");
-        if (!request.History.Any(message => message.Role == ChatRole.User && !string.IsNullOrWhiteSpace(message.Text)))
-            throw new AgentRequestException("Provide at least one user text message.");
-        var agents = await catalog.ResolveAsync([request.Model], ct);
-        return new(agents, AgentWorkflow.Validate(null, null, agents, "workflow_type", "workflow_metadata"),
-            request.History, request.Stream, request.Options, IncludeUsage: request.IncludeUsage);
     }
 
-    private static ProtocolRequest FromChat(ChatCompletionOptions request)
+    internal static ProtocolRequest Decode(JsonElement body, bool chat) => chat
+        ? FromChat(body.Deserialize<ChatCompletionOptions>(ChatJson)!) : FromMessages(body.Deserialize<MessagesRequest>(AgentMessagesJson)!);
+
+    internal static WorkflowResumeRequest? ReadResume(JsonElement body, bool chat)
+    {
+        if (body.ValueKind != JsonValueKind.Object || !body.EnumerateObject().Any(property =>
+            property.Name.Equals(ContinuationField, StringComparison.OrdinalIgnoreCase) && property.Value.ValueKind != JsonValueKind.Null)) return null;
+        ValidateFields(body, chat ? [ContinuationField, "messages", "stream", "stream_options"]
+            : [ContinuationField, "messages", "stream", "max_tokens"], allowRouting: false);
+        var request = chat ? FromChat(body.Deserialize<ChatCompletionOptions>(ChatJson)!, resume: true)
+            : FromMessages(body.Deserialize<MessagesRequest>(AgentMessagesJson)!, resume: true);
+        var token = request.AdditionalProperties!.Single(property => property.Key.Equals(ContinuationField, StringComparison.OrdinalIgnoreCase)).Value;
+        if (token.ValueKind != JsonValueKind.String || token.GetString() is not { Length: 64 } id || !id.All(char.IsAsciiHexDigit))
+            throw new AgentRequestException("Invalid workflow continuation token.");
+        var results = request.History.SelectMany(message => message.Contents).OfType<FunctionResultContent>().ToArray();
+        if (results.Length == 0) throw new AgentRequestException("Provide the tool results for the paused workflow.");
+        return new(id, results.ToDictionary(result => result.CallId, StringComparer.Ordinal), request.Stream, request.IncludeUsage,
+            request.Options.MaxOutputTokens);
+    }
+
+    private static ProtocolRequest FromChat(ChatCompletionOptions request, bool resume = false)
     {
         if (request.NumberOfChoices is not (null or 1)) throw new AgentRequestException("Only one choice is supported ('n': 1).");
         if (request.Store == true) throw new AgentRequestException("Agent runs are stateless; 'store' must be false.");
@@ -57,7 +102,7 @@ internal static class AgentProtocolInput
         };
         SetTools(options, tools, mode);
 
-        var history = new ToolHistory();
+        var history = new ToolHistory(resume);
         var messages = new List<ChatMessage>();
         foreach (var message in request.Messages ?? [])
         {
@@ -71,6 +116,7 @@ internal static class AgentProtocolInput
                 "tool" => ChatRole.Tool,
                 _ => throw new AgentRequestException("Unsupported Chat Completions message role.")
             };
+            if (resume && role != ChatRole.Tool) throw new AgentRequestException("Resume a workflow with tool-result messages only.");
             List<AIContent> parts = message.Content.Text is { } text ? [new TextContent(text)] : (message.Content.Parts ?? []).Select<ChatMessageContentPart, AIContent>(part =>
                 part is ChatMessageTextPart { Text: { } value } ? new TextContent(value) : throw new AgentRequestException("Only text content parts are supported.")).ToList();
             if (role == ChatRole.Tool)
@@ -90,10 +136,10 @@ internal static class AgentProtocolInput
             AddMessage(messages, role, parts);
         }
         history.RequireResults();
-        return new(request.Model, messages, request.Stream == true, options, request.StreamOptions?.IncludeUsage == true);
+        return new(request.Model, request.AdditionalProperties, messages, request.Stream == true, options, request.StreamOptions?.IncludeUsage == true);
     }
 
-    private static ProtocolRequest FromMessages(MessagesRequest request)
+    private static ProtocolRequest FromMessages(MessagesRequest request, bool resume = false)
     {
         if (request.MaxTokens <= 0) throw new AgentRequestException("'max_tokens' must be positive.");
         var choice = request.ToolChoice;
@@ -114,7 +160,7 @@ internal static class AgentProtocolInput
 
         var messages = new List<ChatMessage>();
         if (request.System is { } system) AddMessage(messages, ChatRole.System, TextOnly(system).Select(text => (AIContent)new TextContent(text)).ToList());
-        var history = new ToolHistory();
+        var history = new ToolHistory(resume);
         foreach (var message in request.Messages ?? [])
         {
             if (message?.Content is null || message.Role is not ("user" or "assistant"))
@@ -126,6 +172,8 @@ internal static class AgentProtocolInput
             List<AIContent> parts = [];
             foreach (var block in blocks)
             {
+                if (resume && (assistant || block?.Type != "tool_result"))
+                    throw new AgentRequestException("Resume a workflow with user tool_result blocks only.");
                 switch (block)
                 {
                     case { Type: "text", Text: { } value }:
@@ -150,7 +198,7 @@ internal static class AgentProtocolInput
             if (!assistant) history.RequireResults();
         }
         history.RequireResults();
-        return new(request.Model, messages, request.Stream == true, options);
+        return new(request.Model, request.AdditionalProperties, messages, request.Stream == true, options);
     }
 
     private static IEnumerable<string> TextOnly(MessagesContent content) => content.Text is { } text ? [text] :
@@ -197,7 +245,7 @@ internal static class AgentProtocolInput
         public override JsonElement JsonSchema => schema;
     }
 
-    private sealed class ToolHistory
+    private sealed class ToolHistory(bool resume)
     {
         private readonly HashSet<string> _calls = new(StringComparer.Ordinal);
         private readonly HashSet<string> _pending = new(StringComparer.Ordinal);
@@ -210,7 +258,7 @@ internal static class AgentProtocolInput
             return new(id, name!, input.Deserialize<Dictionary<string, object?>>()!);
         }
 
-        public FunctionResultContent Result(string? id, string output) => id is not null && _pending.Remove(id)
+        public FunctionResultContent Result(string? id, string output) => !string.IsNullOrWhiteSpace(id) && (resume ? _calls.Add(id) : _pending.Remove(id))
             ? new(id, output) : throw new AgentRequestException("Each tool result must match a pending function call ID exactly once.");
 
         public void RequireResults()
@@ -219,5 +267,9 @@ internal static class AgentProtocolInput
         }
     }
 
-    private sealed record ProtocolRequest(string Model, List<ChatMessage> History, bool Stream, ChatOptions Options, bool IncludeUsage = false);
+    internal sealed record ProtocolRequest(string? Model, Dictionary<string, JsonElement>? AdditionalProperties,
+        List<ChatMessage> History, bool Stream, ChatOptions Options, bool IncludeUsage = false);
 }
+
+internal sealed record WorkflowResumeRequest(string Token, IReadOnlyDictionary<string, FunctionResultContent> Results,
+    bool Stream, bool IncludeUsage, int? MaxOutputTokens);

@@ -12,6 +12,181 @@ public sealed class AgentProtocolEndpointTests
     private const string CallId = "call_weather";
 
     [Theory]
+    [InlineData(true, false, "sequential")]
+    [InlineData(false, true, "sequential")]
+    [InlineData(true, true, "concurrent")]
+    [InlineData(false, false, "concurrent")]
+    [InlineData(true, false, "handoff")]
+    [InlineData(false, false, "groupchat")]
+    [InlineData(true, false, "magentic")]
+    public async Task Workflow_tool_results_resume_the_paused_agents(bool chat, bool stream, string workflow)
+    {
+        await using var host = await TestAgentHost.StartAsync();
+        var parallel = workflow == "concurrent";
+        var magentic = workflow == "magentic";
+        var ledgers = 0;
+        host.Gateway.Respond = call =>
+        {
+            var model = call.Body.GetProperty("model").GetString()!;
+            if (magentic && model == "openai/draft")
+            {
+                Assert.False(call.Body.TryGetProperty("tools", out _));
+                if (call.Body.GetProperty("input").EnumerateArray().Last().GetRawText().Contains("is_request_satisfied", StringComparison.Ordinal))
+                    return GatewayFixture.Text(call, JsonSerializer.Serialize(new
+                    {
+                        is_request_satisfied = new { reason = "Fixture", answer = ++ledgers > 1 },
+                        is_in_loop = new { reason = "Fixture", answer = false },
+                        is_progress_being_made = new { reason = "Fixture", answer = true },
+                        next_speaker = new { reason = "Fixture", answer = "Review" },
+                        instruction_or_question = new { reason = "Fixture", answer = "Review the draft." }
+                    }));
+                return GatewayFixture.Text(call, ledgers == 0 ? "Private plan" : "Answer from openai/draft");
+            }
+            var hasResult = call.Body.GetProperty("input").EnumerateArray().Any(item =>
+                item.TryGetProperty("type", out var type) && type.GetString() == "function_call_output");
+            return !hasResult && (parallel || model == (magentic ? "openai/review" : "openai/draft"))
+                ? GatewayFixture.Complete(call, [new { type = "function_call", id = "fc_fixture", call_id = CallId, name = "weather", arguments = WeatherArgs }])
+                : GatewayFixture.Text(call, $"Answer from {model}");
+        };
+        var tools = chat ? """, "tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]"""
+            : """, "tools":[{"name":"weather","input_schema":{"type":"object"}}]""";
+        var metadata = workflow switch
+        {
+            "handoff" => """, "workflow_metadata":{"handoff":{"handoffs":[["Draft",["Review"]]]}}""",
+            "groupchat" => """, "workflow_metadata":{"groupchat":{"maximumIterationCount":1}}""",
+            _ => ""
+        };
+        var start = WithoutModel(chat, """, "agents":[{"name":"Draft","model":{"id":"openai/draft"}}, {"name":"Review","model":{"id":"openai/review"}}]"""
+            + $", \"workflow_type\":\"{workflow}\"" + metadata + tools + (stream ? """, "stream":true""" : ""));
+        using var first = await SendAsync(host, chat, start);
+        var token = await AssertPaused(first);
+        if (magentic)
+        {
+            Assert.Single(host.Gateway.Calls, call => call.Body.GetProperty("model").GetString() == "openai/review");
+            Assert.Equal(1, ledgers);
+        }
+        else Assert.Equal(parallel ? 2 : 1, host.Gateway.Calls.Count);
+        var wrongResult = Resume(chat, token, "wrong", stream);
+        using var wrong = await SendAsync(host, chat, wrongResult);
+        Assert.Equal(HttpStatusCode.BadRequest, wrong.StatusCode);
+        using var wrongOwner = await SendAsync(host, chat, Resume(chat, token, CallId, stream), "different-key");
+        Assert.Equal(HttpStatusCode.BadRequest, wrongOwner.StatusCode);
+        using var resumed = await SendAsync(host, chat, Resume(chat, token, CallId, stream));
+        using var replay = await SendAsync(host, chat, Resume(chat, token, CallId, stream));
+        Assert.Equal(HttpStatusCode.BadRequest, replay.StatusCode);
+        if (parallel)
+        {
+            var secondToken = await AssertPaused(resumed);
+            Assert.NotEqual(token, secondToken);
+            using var completed = await SendAsync(host, chat, Resume(chat, secondToken, CallId, stream));
+            var finalText = await completed.Content.ReadAsStringAsync();
+            Assert.True(completed.IsSuccessStatusCode, finalText);
+            Assert.Contains("Answer from openai/draft", finalText);
+            Assert.DoesNotContain("Private plan", finalText);
+            Assert.Contains("Answer from openai/review", finalText);
+        }
+        else
+        {
+            var finalText = await resumed.Content.ReadAsStringAsync();
+            Assert.True(resumed.IsSuccessStatusCode, finalText);
+            Assert.Contains("Answer from openai/draft", finalText);
+            Assert.DoesNotContain("workflow_continuation", finalText);
+        }
+        var returning = host.Gateway.Calls.Where(call => call.Body.GetRawText().Contains("function_call_output", StringComparison.Ordinal)).ToArray();
+        Assert.Contains(returning, call => call.Body.GetProperty("model").GetString() == (magentic ? "openai/review" : "openai/draft"));
+        Assert.Equal(parallel || magentic ? 2 : workflow == "sequential" ? 1 : 0,
+            host.Gateway.Calls.Count(call => call.Body.GetProperty("model").GetString() == "openai/review"));
+        if (magentic) Assert.Equal(2, ledgers);
+        else Assert.Equal(2, host.Gateway.Calls.Count(call => call.Body.GetProperty("model").GetString() == "openai/draft"));
+        Assert.All(host.Gateway.Calls, call => Assert.False(call.Body.TryGetProperty("workflow_continuation", out _)));
+
+        async Task<string> AssertPaused(HttpResponseMessage reply)
+        {
+            var content = await reply.Content.ReadAsStringAsync();
+            Assert.True(reply.IsSuccessStatusCode, content);
+            Assert.Contains(CallId, content);
+            Assert.Contains(chat ? "\"finish_reason\":\"tool_calls\"" : "\"stop_reason\":\"tool_use\"", content);
+            var frames = stream ? Frames(content) : [Parse(content)];
+            return Assert.Single(frames, frame => frame.TryGetProperty("workflow_continuation", out _))
+                .GetProperty("workflow_continuation").GetString()!;
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Decisions_preserves_the_winner_across_repeated_tool_rounds(bool chat)
+    {
+        await using var host = await TestAgentHost.StartAsync();
+        var turns = 0;
+        host.Gateway.Respond = call => call.Endpoint.AbsolutePath.EndsWith("/api/decisions", StringComparison.Ordinal)
+            ? GatewayFixture.Reply("""{"answers":{"agent":{"type":"choice","choice":"agent-1"}}}""")
+            : ++turns <= 2 ? GatewayFixture.Complete(call, [new { type = "function_call", id = "fc_fixture", call_id = CallId, name = "weather", arguments = WeatherArgs }])
+            : GatewayFixture.Text(call, "Decision winner completed");
+        var tools = chat ? """, "tools":[{"type":"function","function":{"name":"weather"}}]"""
+            : """, "tools":[{"name":"weather","input_schema":{"type":"object"}}]""";
+        using var initial = await SendAsync(host, chat, WithoutModel(chat,
+            """, "models":["GreetingAgent","ReviewAgent"], "workflow_type":"decisions", "workflow_metadata":{"decisions":{"model":"openai/router"}}""" + tools));
+        var first = await Token(initial);
+        using var second = await SendAsync(host, chat, Resume(chat, first, CallId, false));
+        using var completed = await SendAsync(host, chat, Resume(chat, await Token(second), CallId, false));
+        Assert.Equal(HttpStatusCode.OK, completed.StatusCode);
+        Assert.Contains("Decision winner completed", await completed.Content.ReadAsStringAsync());
+        Assert.Single(host.Gateway.Calls, call => call.Endpoint.AbsolutePath.EndsWith("/api/decisions", StringComparison.Ordinal));
+        Assert.All(host.Gateway.Calls.Where(call => call.Endpoint.AbsolutePath.EndsWith("/v1/responses", StringComparison.Ordinal)),
+            call => Assert.Equal("openai/review", call.Body.GetProperty("model").GetString()));
+        Assert.Equal(3, turns);
+
+        static async Task<string> Token(HttpResponseMessage reply)
+        {
+            var json = await reply.Content.ReadAsStringAsync();
+            Assert.True(reply.IsSuccessStatusCode, json);
+            return Parse(json).GetProperty("workflow_continuation").GetString()!;
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Catalog_and_inline_extensions_keep_native_response_shapes_and_validate_input(bool chat)
+    {
+        await using var host = await TestAgentHost.StartAsync();
+        using var inline = await SendAsync(host, chat, WithoutModel(chat,
+            """, "agent":{"name":"Inline","instructions":"Inline instructions","model":{"id":"openai/inline"}}"""));
+        var json = await inline.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(HttpStatusCode.OK, inline.StatusCode);
+        Assert.Equal("Inline", json.GetProperty("model").GetString());
+        Assert.Contains("Inline instructions", Assert.Single(host.Gateway.Calls).Body.GetRawText());
+
+        using var catalog = await SendAsync(host, chat, WithoutModel(chat, """, "models":["greetingagent","ReviewAgent"]"""));
+        Assert.Equal(HttpStatusCode.OK, catalog.StatusCode);
+        var workflow = await catalog.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("sequential", workflow.GetProperty("model").GetString());
+        Assert.Contains("Hello there", workflow.GetRawText());
+        Assert.Equal(3, host.Gateway.Calls.Count);
+        foreach (var options in new[] { "", ", \"models\":\"GreetingAgent\"", """, "agents":[null]""",
+                     ", \"models\":[\"GreetingAgent\"],\"workflowType\":\"concurrent\"", """, "models":["GreetingAgent"],"unknown":true""" })
+        {
+            using var invalid = await SendAsync(host, chat, WithoutModel(chat, options));
+            Assert.Equal(HttpStatusCode.BadRequest, invalid.StatusCode);
+        }
+        Assert.Equal(3, host.Gateway.Calls.Count);
+    }
+
+    private static string Resume(bool chat, string token, string id, bool stream) =>
+        $"{{\"workflow_continuation\":\"{token}\",\"stream\":{(stream ? "true" : "false")}," + (chat
+            ? $$$"""
+                "messages":[{"role":"tool","tool_call_id":"{{{id}}}","content":"sunny"}]}
+                """
+            : $$$"""
+                "max_tokens":128,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"{{{id}}}","content":"sunny"}]}]}
+                """);
+
+    private static string WithoutModel(bool chat, string options) => $$$"""
+        {"messages":[{{{UserMessage}}}]{{{(chat ? "" : ", \"max_tokens\":128")}}}{{{options}}}}
+        """;
+
+    [Theory]
     [InlineData(true)]
     [InlineData(false)]
     public async Task Json_preserves_agent_name_instructions_and_gateway_routing(bool chat)

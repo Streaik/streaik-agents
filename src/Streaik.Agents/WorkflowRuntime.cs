@@ -54,7 +54,8 @@ public sealed partial class AgentRuntime
 
     internal async IAsyncEnumerable<AgentResponseUpdate> RunWorkflowAsync(AgentWorkflow workflow,
         IReadOnlyList<AgentRunTarget> targets, List<ChatMessage> messages, ChatOptions? options, bool stream,
-        [EnumeratorCancellation] CancellationToken ct, AgentRunAccounting accounting, bool reportHostedActivity = false)
+        [EnumeratorCancellation] CancellationToken ct, AgentRunAccounting accounting, bool reportHostedActivity = false,
+        bool standardProtocol = false, WorkflowToolExchange? exchange = null)
     {
         await using var turns = new WorkflowToolTurns();
         var agents = new List<AIAgent>(targets.Count);
@@ -62,16 +63,42 @@ public sealed partial class AgentRuntime
         {
             var turn = await OpenToolsAsync(target, ct);
             if (turn is not null) turns.Items.Add(turn);
-            agents.Add(CreateAgent(target, turn, options, accounting, reportHostedActivity: reportHostedActivity));
+            var defaults = options;
+            if (standardProtocol && workflow.Type == "magentic" && agents.Count == 0 && options is not null)
+            {
+                // The manager's prompts and structured planning are internal, not caller turns.
+                defaults = options.Clone();
+                defaults.Tools = null;
+                defaults.ToolMode = null;
+            }
+            agents.Add(CreateAgent(target, turn, defaults, accounting, reportHostedActivity: reportHostedActivity,
+                standardProtocol: standardProtocol, agentId: exchange is null ? null : $"streaik-agent-{agents.Count}"));
         }
+        // The built-in hosts turn unmatched function calls into external requests by default.
+        // InterceptUnterminatedFunctionCalls would route them inside the graph instead.
         var graph = BuildWorkflow(workflow, targets.Select(target => target.Definition).ToArray(), agents);
         // Our endpoints expose one text item. Use the aggregated output for concurrent branches
         // to avoid interleaving their tokens, and the final answer for Magentic to keep planning private.
-        var live = stream && workflow.Type is not ("concurrent" or "magentic");
-        await using var run = await InProcessExecution.RunStreamingAsync(graph, messages, cancellationToken: ct);
-        await run.TrySendMessageAsync(new TurnToken(emitEvents: live || reportHostedActivity));
+        // A resumable workflow emits aggregate text only when it finishes. This avoids replaying
+        // earlier text (or exposing Magentic planning) when the next HTTP request restores it.
+        var live = stream && exchange is null && workflow.Type is not ("concurrent" or "magentic");
+        var checkpoint = exchange?.Checkpoints.Latest;
+        var manager = exchange is null ? null : CheckpointManager.CreateJson(exchange.Checkpoints);
+        await using var run = checkpoint is not null
+            ? await InProcessExecution.ResumeStreamingAsync(graph, checkpoint.Info, manager!, ct)
+            : manager is not null ? await InProcessExecution.RunStreamingAsync(graph, messages, manager, cancellationToken: ct)
+                : await InProcessExecution.RunStreamingAsync(graph, messages, cancellationToken: ct);
+        if (checkpoint is null)
+            await run.TrySendMessageAsync(new TurnToken(emitEvents: live || reportHostedActivity));
+        else
+        {
+            foreach (var pending in exchange!.Answered)
+                await run.SendResponseAsync(new ExternalResponse(pending.Port, pending.RequestId,
+                    new PortableValue(exchange.Results![pending.Call.CallId])));
+        }
 
         var textEmitted = false;
+        var restoredAnswers = exchange?.Answered.Select(call => call.RequestId).ToHashSet(StringComparer.Ordinal);
         string? author = null;
         string? lastResponseId = null;
         string? result = null;
@@ -79,6 +106,9 @@ public sealed partial class AgentRuntime
         {
             switch (item)
             {
+                case SuperStepStartedEvent:
+                    restoredAnswers?.Clear();
+                    break;
                 case WorkflowErrorEvent error:
                     throw error.Exception ?? new InvalidOperationException("The workflow failed.");
                 case AgentResponseUpdateEvent { Update: var activity } when reportHostedActivity
@@ -96,6 +126,14 @@ public sealed partial class AgentRuntime
                 case WorkflowOutputEvent output when !output.IsIntermediate():
                     result = OutputText(output.Data, messages);
                     break;
+                case RequestInfoEvent request when exchange is not null && request.Request.TryGetDataAs<FunctionCallContent>(out var call):
+                    var external = request.Request;
+                    // Resuming can re-emit the checkpoint's pending requests before consuming answers.
+                    if (restoredAnswers?.Remove(external.RequestId) == true) break;
+                    if (options?.Tools?.OfType<AIFunctionDeclaration>().Any(tool => tool.Name == call.Name) != true)
+                        throw new InvalidOperationException("The workflow requested an undeclared caller tool.");
+                    exchange.Pending[external.RequestId] = new(external.PortInfo, external.RequestId, call);
+                    break;
                 case RequestInfoEvent request when workflow.Type == "handoff" && request.Request.TryGetDataAs<List<ChatMessage>>(out var history):
                     // The standard handoff stops at the next user turn. This API deliberately doesn't resume it.
                     result = OutputText(history, messages);
@@ -106,6 +144,7 @@ public sealed partial class AgentRuntime
         }
 
         ct.ThrowIfCancellationRequested();
+        if (exchange?.Pending.Count > 0) yield break;
         if (result is null && !textEmitted)
             throw new InvalidOperationException("The workflow did not produce an output.");
         if (!textEmitted && result is { Length: > 0 }) yield return new AgentResponseUpdate(ChatRole.Assistant, result);
@@ -140,7 +179,7 @@ public sealed partial class AgentRuntime
     {
         switch (workflow.Type)
         {
-            case "sequential": return AgentWorkflowBuilder.BuildSequential(agents);
+            case "sequential" or "decisions": return AgentWorkflowBuilder.BuildSequential(agents);
             case "concurrent": return AgentWorkflowBuilder.BuildConcurrent(agents);
             case "groupchat":
                 return AgentWorkflowBuilder.CreateGroupChatBuilderWith(team => new RoundRobinGroupChatManager(team)

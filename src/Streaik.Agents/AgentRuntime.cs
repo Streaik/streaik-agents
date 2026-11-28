@@ -79,7 +79,7 @@ public sealed partial class AgentRuntime(HttpClient gateway, HostedToolAccess? h
     }
 
     private ChatClientAgent CreateAgent(AgentRunTarget target, HostedToolTurn? turn, ChatOptions? defaults = null, AgentRunAccounting? accounting = null,
-        AgentMcpApprovals? approvals = null, bool reportHostedActivity = false, bool standardProtocol = false)
+        AgentMcpApprovals? approvals = null, bool reportHostedActivity = false, bool standardProtocol = false, string? agentId = null)
     {
         var definition = target.Definition;
         IChatClient client = GetTransport(definition) switch
@@ -88,7 +88,12 @@ public sealed partial class AgentRuntime(HttpClient gateway, HostedToolAccess? h
                 turn, target.Tools.Server, target.Tools.NativeMcp, approvals, reportHostedActivity, standardProtocol),
             _ => throw new InvalidOperationException("Agent transport was not registered.")
         };
-        return new ChatClientAgent(client, instructions: definition.Instructions,
-            name: definition.Name, description: definition.Description);
+        var agentOptions = standardProtocol ? defaults?.Clone() ?? new ChatOptions() : new ChatOptions();
+        agentOptions.Instructions = definition.Instructions;
+        return new ChatClientAgent(client, new ChatClientAgentOptions
+        {
+            Id = agentId, Name = definition.Name, Description = definition.Description,
+            ChatOptions = agentOptions
+        });
     }
 }

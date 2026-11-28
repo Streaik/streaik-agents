@@ -39,15 +39,7 @@ internal sealed record AgentInput(IReadOnlyList<Agent> Agents, AgentWorkflow Wor
         var chat = ui ? body.Deserialize<AgentChatRequest>(WebJson) : null;
         var responses = ui ? null : body.Deserialize<AgentResponsesRequest>(WebJson);
         AgentSelection selection = chat is not null ? chat : responses!;
-        var agents = new List<Agent>();
-        if (selection.Agent is { } inline) agents.Add(ValidateInline(inline));
-        foreach (var agent in selection.Agents ?? [])
-            agents.Add(ValidateInline(agent ?? throw new AgentRequestException("'agents' must contain agent definitions.")));
-        var names = selection.Models ?? [];
-        if (selection.Model is { } model) names = [.. names, model];
-        agents.AddRange(await catalog.ResolveAsync(names, cancellationToken));
-        if (agents.Count == 0)
-            throw new AgentRequestException("Select at least one agent using 'model', 'models', 'agent', or 'agents'.");
+        var agents = await ResolveAgentsAsync(catalog, selection.Model, selection.Models, selection.Agent, selection.Agents, cancellationToken);
         var workflow = AgentWorkflow.Validate(chat?.WorkflowType ?? responses?.WorkflowType,
             chat?.WorkflowMetadata ?? responses?.WorkflowMetadata, agents, typeField, metadataField);
         var nativeTools = agents.SelectMany(agent => AgentHostedTools.Read(agent).NativeMcp).ToArray();
@@ -102,13 +94,23 @@ internal sealed record AgentInput(IReadOnlyList<Agent> Agents, AgentWorkflow Wor
 
     private static string Hash<T>(T value) => Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(value, WebJson)));
 
-    private static Agent ValidateInline(Agent agent)
+    internal static async Task<IReadOnlyList<Agent>> ResolveAgentsAsync(AgentCatalog catalog, string? model,
+        IReadOnlyList<string?>? models, Agent? agent, IReadOnlyList<Agent?>? inlineAgents, CancellationToken ct)
     {
-        AgentRuntime.Validate(agent);
-        return agent;
+        var agents = new List<Agent>();
+        if (agent is not null) agents.Add(agent);
+        foreach (var inline in inlineAgents ?? [])
+            agents.Add(inline ?? throw new AgentRequestException("'agents' must contain agent definitions."));
+        foreach (var inline in agents) AgentRuntime.Validate(inline);
+        var names = models ?? [];
+        if (model is not null) names = [.. names, model];
+        agents.AddRange(await catalog.ResolveAsync(names, ct));
+        if (agents.Count == 0)
+            throw new AgentRequestException("Select at least one agent using 'model', 'models', 'agent', or 'agents'.");
+        return agents;
     }
 
-    private static void RejectAlternateField(JsonElement body, string name, string alternate)
+    internal static void RejectAlternateField(JsonElement body, string name, string alternate)
     {
         if (body.EnumerateObject().Any(field => field.Name.Equals(alternate, StringComparison.OrdinalIgnoreCase)))
             throw new AgentRequestException($"Use '{name}' on this endpoint, not '{alternate}'.");

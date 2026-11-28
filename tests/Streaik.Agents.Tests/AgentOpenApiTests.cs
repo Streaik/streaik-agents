@@ -73,11 +73,24 @@ public sealed class AgentOpenApiTests
         {
             var operation = document["paths"]![path]!["post"]!;
             var request = operation["requestBody"]!["content"]!["application/json"]!;
+            var schema = request["schema"]!;
+            if (schema["$ref"] is { } reference) schema = document["components"]!["schemas"]![reference.GetValue<string>().Split('/')[^1]]!;
+            if (requiresMaxTokens)
+            {
+                Assert.Contains("max_tokens", Strings(schema["required"]!));
+                Assert.DoesNotContain("model", Strings(schema["required"]!));
+            }
             var examples = request["examples"]!.AsObject();
-            Assert.Single(examples);
             var example = examples["namedAgent"]!["value"]!;
             Assert.Equal("GreetingAgent", example["model"]!.GetValue<string>());
             Assert.Equal(requiresMaxTokens, example["max_tokens"] is not null);
+            var workflow = examples["workflow"]!["value"]!;
+            Assert.Null(workflow["model"]);
+            Assert.Equal("sequential", workflow["workflow_type"]!.GetValue<string>());
+            Assert.Equal(requiresMaxTokens, workflow["max_tokens"] is not null);
+            var resume = examples["continueWorkflow"]!["value"]!;
+            Assert.NotNull(resume["workflow_continuation"]);
+            Assert.Equal(requiresMaxTokens, resume["max_tokens"] is not null);
             var responsesContent = operation["responses"]!["200"]!["content"]!;
             Assert.NotNull(responsesContent["application/json"]);
             Assert.NotNull(responsesContent["text/event-stream"]);
